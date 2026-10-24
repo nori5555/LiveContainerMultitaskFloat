@@ -1,4 +1,4 @@
-TARGET := iphone:clang:latest:15.0
+TARGET := iphone:clang:latest:16.0
 INSTALL_TARGET_PROCESSES :=
 
 include $(THEOS)/makefiles/common.mk
