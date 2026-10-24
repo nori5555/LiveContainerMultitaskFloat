@@ -1,0 +1,72 @@
+name: Build tweak
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos
+        uses: beerpiss/theos-action@v1
+        with:
+          # The default cache path (/usr/local/opt) no longer exists on
+          # GitHub's macOS runners. runner.temp is always writable.
+          cache-dir-theos: ${{ runner.temp }}/theos-cache
+          cache-dir-sdks: ${{ runner.temp }}/theos-sdks-cache
+
+      - name: Build package
+        run: make package FINALPACKAGE=1
+
+      - name: Upload tweak dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultitaskFloat.dylib
+          path: .theos/_/Library/MobileSubstrate/DynamicLibraries/MultitaskFloat.dylib
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download tweak dylib
+        uses: actions/download-artifact@v4
+        with:
+          name: MultitaskFloat.dylib
+          path: release
+
+      - name: Publish nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -s release/MultitaskFloat.dylib
+          notes="Automated build from commit ${GITHUB_SHA}. Download MultitaskFloat.dylib and import it into LiveContainer. Please note that nightly builds are unstable and this release is updated frequently."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/nightly" \
+              -f sha="$GITHUB_SHA" -F force=true
+            gh release edit nightly --title "Nightly" --notes "$notes" --prerelease
+            gh release upload nightly release/MultitaskFloat.dylib --clobber
+          else
+            gh release create nightly release/MultitaskFloat.dylib \
+              --target "$GITHUB_SHA" --title "Nightly" --notes "$notes" --prerelease
+          fi
