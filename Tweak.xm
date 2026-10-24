@@ -1,5 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <string.h>
+#import <stdlib.h>
 
 // LiveContainer's multitasking virtual windows are DecoratedAppSceneViewController:
 // a vertical stack of [44pt UINavigationBar, content]. The bar holds the app
@@ -7,40 +9,44 @@
 // traffic-light UIBarButtonItems: close (red, closeWindow), maximize (green,
 // maximizeWindow), minimize (yellow, minimizeWindow).
 //
-// This tweak keeps only the title menu and the minimize button, and turns
-// the bar from a fixed row into a translucent strip floating over the app:
-//  1. Filter the bar button items to the minimize item only (maximize and
-//     close are removed; their methods stay, they just have no button).
-//  2. Give the navigation bar a dark translucent background and remove its
-//     hairline, so the app shows through behind the floating strip while
-//     the controls stay readable. Title text is forced white for the same
-//     reason.
-//  3. Re-pin the hosted scene to the full window (top = view.top, bottom =
-//     view.bottom) instead of leaving a 44pt gap under the bar, so the bar
-//     overlays the app content instead of pushing it down. The bar itself
-//     stays an arranged subview in front of the scene (inserted later, so
-//     it renders above), so it keeps its drag-to-move gesture, and the
-//     resize handle and the side multitask dock are untouched.
+// This tweak strips the window chrome down to just the three traffic-light
+// buttons, floating directly over the app:
+//  1. The app title and its menu are removed (title and titleMenuProvider
+//     cleared), so no app name shows.
+//  2. The navigation bar itself becomes fully transparent (empty background
+//     image, no hairline) — NOT translucent-dark. The hosted scene is
+//     re-pinned to the full window (top = view.top, bottom = view.bottom)
+//     instead of leaving a 44pt gap under the bar, so the top of the window
+//     is entirely the app, with only the three buttons overlaid on it.
+//     The bar stays an arranged subview in front of the scene, so it keeps
+//     its drag-to-move gesture, and the resize handle is untouched.
+//  3. The side multitask dock is removed: MultitaskDockManager's showDock
+//     is neutralized so the dock view never appears, and any already-visible
+//     dock is hidden when a window is created. (updateDockFrame only moves
+//     the dock's frame and never touches its alpha, so blocking showDock —
+//     the only place that fades the dock in — keeps it gone for good. The
+//     edge-swipe gestures remain but do nothing visible.)
 //  4. The existing auto-hide behavior is respected: when the dock is
 //     collapsed and the window is maximized, LiveContainer hides the bar
-//     (height 0); this tweak does not un-hide it, it only removes the
-//     44pt gap in the states where the bar is visible.
+//     (height 0); this tweak does not un-hide it. In practice the collapse
+//     toggle lives in the dock itself, so once the dock is gone the bar
+//     stays visible.
 //
 // Safety (learned the hard way with AutoDarkIcon): the constructor runs at
-// dyld init, before UIKit is ready. It does ONLY the method swizzles. All
-// UIKit work happens later, when windows are created and laid out
-// (post-launch), never in the constructor. No %hook: a %hook build links
-// /Library/Frameworks/CydiaSubstrate, which does not exist on jailed
-// devices, so the tweak would fail to load.
+// dyld init, before UIKit is ready. It does ONLY pure runtime calls
+// (class lookup, method swizzles). All UIKit work happens later, when
+// windows are created and laid out (post-launch), never in the constructor.
+// No %hook: a %hook build links /Library/Frameworks/CydiaSubstrate, which
+// does not exist on jailed devices, so the tweak would fail to load.
 //
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
-// class only exists in LiveContainer itself, so in guest apps this tweak
+// classes only exist in LiveContainer itself, so in guest apps this tweak
 // is a no-op.
 
-// Minimal interface: only what this tweak touches. The real header pulls in
-// private headers, so it cannot be imported in a tweak build.
+// Minimal interface: only what this tweak touches. The real headers pull in
+// private headers or are Swift-generated, so they cannot be imported here.
 @interface DecoratedAppSceneViewController : UIViewController
 @property(nonatomic) UINavigationBar *navigationBar;
 @property(nonatomic) UINavigationItem *navigationItem;
@@ -52,49 +58,68 @@ typedef id (*DecoratedInitIMP)(id, SEL, NSString *, NSString *, NSString *, UIVi
 typedef void (*VoidIMP)(id, SEL);
 static DecoratedInitIMP origDecoratedInit = NULL;
 static VoidIMP origUpdateVerticalConstraints = NULL;
+static BOOL dockSwizzled = NO;
 
-static NSArray *MultitaskFloatKeepMinimize(NSArray *items) {
-    if (!items) return nil;
-    NSMutableArray *kept = [NSMutableArray array];
-    for (UIBarButtonItem *item in items) {
-        if (item.action == @selector(minimizeWindow)) [kept addObject:item];
+// MultitaskDockManager is a Swift class; its ObjC runtime name may carry
+// the module prefix, so look it up by substring instead of exact name.
+static Class MultitaskFloatDockManagerClass(void) {
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return Nil;
+    Class *list = (Class *)malloc(sizeof(Class) * (size_t)count);
+    if (!list) return Nil;
+    count = objc_getClassList(list, count);
+    Class found = Nil;
+    for (int i = 0; i < count; i++) {
+        const char *name = class_getName(list[i]);
+        if (name && strstr(name, "MultitaskDockManager") != NULL) { found = list[i]; break; }
     }
-    return kept;
+    free(list);
+    return found;
 }
 
-static void MultitaskFloatFilterButtons(DecoratedAppSceneViewController *vc) {
+static void MultitaskFloatSwizzleDock(void) {
+    if (dockSwizzled) return;
+    Class cls = MultitaskFloatDockManagerClass();
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, @selector(showDock));
+    if (!m) return;
+    // Neutralize showDock: it is the only place that fades the dock in.
+    // Replacing it with a no-op keeps the dock gone permanently.
+    method_setImplementation(m, imp_implementationWithBlock(^(id self) {}));
+    dockSwizzled = YES;
+}
+
+static void MultitaskFloatHideDock(void) {
+    Class cls = MultitaskFloatDockManagerClass();
+    if (!cls) return;
+    id manager = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(shared));
+    if (manager) ((void (*)(id, SEL))objc_msgSend)(manager, @selector(hideDock));
+}
+
+static void MultitaskFloatStripBar(DecoratedAppSceneViewController *vc) {
     if (!vc.navigationItem) return;
-    vc.navigationItem.rightBarButtonItems = MultitaskFloatKeepMinimize(vc.navigationItem.rightBarButtonItems);
-    vc.navigationItem.leftBarButtonItems = MultitaskFloatKeepMinimize(vc.navigationItem.leftBarButtonItems);
-}
-
-static void MultitaskFloatStyleBar(UINavigationBar *bar) {
-    if (!bar) return;
-    bar.translucent = YES;
-    // 1x1 dark translucent image as the bar background, so the app shows
-    // through behind the floating strip while the controls stay readable.
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(1, 1)];
-    UIImage *bg = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [[UIColor colorWithWhite:0.0 alpha:0.45] setFill];
-        CGContextFillRect(ctx.CGContext, CGRectMake(0, 0, 1, 1));
-    }];
-    [bar setBackgroundImage:bg forBarMetrics:UIBarMetricsDefault];
-    bar.shadowImage = [UIImage new];
-    bar.titleTextAttributes = @{NSForegroundColorAttributeName: UIColor.whiteColor};
+    // No app name, no menu chevron.
+    vc.navigationItem.title = nil;
+    vc.navigationItem.titleMenuProvider = nil;
+    // Fully transparent bar: no background, no hairline, no dark tint.
+    UINavigationBar *bar = vc.navigationBar;
+    if (bar) {
+        bar.translucent = YES;
+        [bar setBackgroundImage:[UIImage new] forBarMetrics:UIBarMetricsDefault];
+        bar.shadowImage = [UIImage new];
+    }
 }
 
 static id MultitaskFloatInit(id self, SEL _cmd, NSString *windowName, NSString *bundleId, NSString *dataUUID, UIViewController *rootVC) {
     id vc = origDecoratedInit(self, _cmd, windowName, bundleId, dataUUID, rootVC);
     if (vc) {
         DecoratedAppSceneViewController *dvc = (DecoratedAppSceneViewController *)vc;
-        MultitaskFloatFilterButtons(dvc);
-        MultitaskFloatStyleBar(dvc.navigationBar);
-        // The bar-button spacing pass runs 0.1s after init; re-apply the
-        // filter after it, in case it ever re-adds items.
-        __weak DecoratedAppSceneViewController *weakVC = dvc;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            MultitaskFloatFilterButtons(weakVC);
-        });
+        // All three traffic-light buttons stay; only the title/bar go away.
+        MultitaskFloatStripBar(dvc);
+        // Dock: make sure the swizzle is in place, and hide any dock that
+        // is already visible.
+        MultitaskFloatSwizzleDock();
+        MultitaskFloatHideDock();
     }
     return vc;
 }
@@ -102,6 +127,8 @@ static id MultitaskFloatInit(id self, SEL _cmd, NSString *windowName, NSString *
 static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
     origUpdateVerticalConstraints(self, _cmd);
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    // Re-apply the strip in case the title was ever re-set.
+    MultitaskFloatStripBar(vc);
     UIView *sceneView = vc.appSceneVC.view;
     if (!sceneView || !vc.view) return;
     // Drop only the scene's top/bottom constraints that the original just
@@ -129,6 +156,7 @@ __attribute__((constructor))
 static void MultitaskFloatInit(void) {
     // Dyld-init time: ONLY pure runtime calls. No UIKit, no defaults, no
     // Security. Everything else happens when windows are created/laid out.
+    MultitaskFloatSwizzleDock();
     Class cls = objc_getClass("DecoratedAppSceneViewController");
     if (!cls) return;
     Method mInit = class_getInstanceMethod(cls, @selector(initWindowName:bundleId:dataUUID:rootVC:));
