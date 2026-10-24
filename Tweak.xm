@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <string.h>
 #import <stdlib.h>
 
@@ -110,7 +111,7 @@ static void MultitaskFloatStripBar(DecoratedAppSceneViewController *vc) {
     }
 }
 
-static id MultitaskFloatInit(id self, SEL _cmd, NSString *windowName, NSString *bundleId, NSString *dataUUID, UIViewController *rootVC) {
+static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSString *bundleId, NSString *dataUUID, UIViewController *rootVC) {
     id vc = origDecoratedInit(self, _cmd, windowName, bundleId, dataUUID, rootVC);
     if (vc) {
         DecoratedAppSceneViewController *dvc = (DecoratedAppSceneViewController *)vc;
@@ -153,7 +154,7 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
 }
 
 __attribute__((constructor))
-static void MultitaskFloatInit(void) {
+static void MultitaskFloatConstructor(void) {
     // Dyld-init time: ONLY pure runtime calls. No UIKit, no defaults, no
     // Security. Everything else happens when windows are created/laid out.
     MultitaskFloatSwizzleDock();
@@ -162,7 +163,7 @@ static void MultitaskFloatInit(void) {
     Method mInit = class_getInstanceMethod(cls, @selector(initWindowName:bundleId:dataUUID:rootVC:));
     if (mInit) {
         origDecoratedInit = (DecoratedInitIMP)method_getImplementation(mInit);
-        method_setImplementation(mInit, (IMP)MultitaskFloatInit);
+        method_setImplementation(mInit, (IMP)MultitaskFloatInitImpl);
     }
     Method mLayout = class_getInstanceMethod(cls, @selector(updateVerticalConstraints));
     if (mLayout) {
