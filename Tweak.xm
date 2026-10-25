@@ -16,22 +16,27 @@
 //     cleared), so no app name shows.
 //  2. The navigation bar itself becomes fully transparent (empty background
 //     image, no hairline) — NOT translucent-dark. The hosted scene is
-//     re-pinned to the full window (top = view.top, bottom = view.bottom)
-//     instead of leaving a 44pt gap under the bar, so the top of the window
-//     is entirely the app, with only the three buttons overlaid on it.
-//     The bar stays an arranged subview in front of the scene, so it keeps
-//     its drag-to-move gesture, and the resize handle is untouched.
-//  3. The side multitask dock is removed: MultitaskDockManager's showDock
-//     is neutralized so the dock view never appears, and any already-visible
-//     dock is hidden when a window is created. (updateDockFrame only moves
-//     the dock's frame and never touches its alpha, so blocking showDock —
-//     the only place that fades the dock in — keeps it gone for good. The
-//     edge-swipe gestures remain but do nothing visible.)
-//  4. The existing auto-hide behavior is respected: when the dock is
-//     collapsed and the window is maximized, LiveContainer hides the bar
-//     (height 0); this tweak does not un-hide it. In practice the collapse
-//     toggle lives in the dock itself, so once the dock is gone the bar
-//     stays visible.
+//     extended to the full window so the top of the window is entirely the
+//     app, with only the three buttons overlaid on it. The bar stays an
+//     arranged subview in front of the scene, so it keeps its drag-to-move
+//     gesture, and the resize handle is untouched.
+//  3. The side multitask dock is removed using LiveContainer's own hidden
+//     state: hideDockToSide moves the dock off-screen through updateDockFrame
+//     (the designed mechanism), and the paths that would bring it back
+//     (showDockFromHidden, toggleDockVisibility) are redirected to hide it
+//     again. Nothing is neutralized outright, so window creation keeps all
+//     of its internal state consistent.
+//
+// v4 notes (crash fix): the first release crashed when opening multitask
+// windows. Two mechanisms were replaced with strictly less invasive ones:
+//  - Scene height: instead of deactivating the scene's top/bottom constraints
+//    and activating new ones (restructuring the layout during window setup),
+//    this version only zeroes the CONSTANT of the existing scene top/bottom
+//    constraints that the original just installed. Same final layout, no
+//    layout-engine restructuring.
+//  - Dock: instead of replacing showDock with a no-op (which left window
+//    creation's dock state inconsistent), the dock is hidden through the
+//    supported hideDockToSide path, and only the re-show paths are redirected.
 //
 // Safety (learned the hard way with AutoDarkIcon): the constructor runs at
 // dyld init, before UIKit is ready. It does ONLY pure runtime calls
@@ -78,23 +83,27 @@ static Class MultitaskFloatDockManagerClass(void) {
     return found;
 }
 
+// Any path that would bring the dock back is redirected to hide it again.
+static void MultitaskFloatForceHideDock(id self, SEL _cmd) {
+    ((void (*)(id, SEL))objc_msgSend)(self, @selector(hideDockToSide));
+}
+
 static void MultitaskFloatSwizzleDock(void) {
     if (dockSwizzled) return;
     Class cls = MultitaskFloatDockManagerClass();
     if (!cls) return;
-    Method m = class_getInstanceMethod(cls, @selector(showDock));
-    if (!m) return;
-    // Neutralize showDock: it is the only place that fades the dock in.
-    // Replacing it with a no-op keeps the dock gone permanently.
-    method_setImplementation(m, imp_implementationWithBlock(^(id self) {}));
+    Method mShow = class_getInstanceMethod(cls, @selector(showDockFromHidden));
+    if (mShow) method_setImplementation(mShow, (IMP)MultitaskFloatForceHideDock);
+    Method mToggle = class_getInstanceMethod(cls, @selector(toggleDockVisibility));
+    if (mToggle) method_setImplementation(mToggle, (IMP)MultitaskFloatForceHideDock);
     dockSwizzled = YES;
 }
 
-static void MultitaskFloatHideDock(void) {
+static void MultitaskFloatHideDockToSide(void) {
     Class cls = MultitaskFloatDockManagerClass();
     if (!cls) return;
     id manager = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(shared));
-    if (manager) ((void (*)(id, SEL))objc_msgSend)(manager, @selector(hideDock));
+    if (manager) ((void (*)(id, SEL))objc_msgSend)(manager, @selector(hideDockToSide));
 }
 
 static void MultitaskFloatStripBar(DecoratedAppSceneViewController *vc) {
@@ -117,10 +126,10 @@ static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSStri
         DecoratedAppSceneViewController *dvc = (DecoratedAppSceneViewController *)vc;
         // All three traffic-light buttons stay; only the title/bar go away.
         MultitaskFloatStripBar(dvc);
-        // Dock: make sure the swizzle is in place, and hide any dock that
-        // is already visible.
+        // Dock: make sure the re-show redirects are in place, and move the
+        // dock off-screen through the supported path.
         MultitaskFloatSwizzleDock();
-        MultitaskFloatHideDock();
+        MultitaskFloatHideDockToSide();
     }
     return vc;
 }
@@ -132,25 +141,26 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
     MultitaskFloatStripBar(vc);
     UIView *sceneView = vc.appSceneVC.view;
     if (!sceneView || !vc.view) return;
-    // Drop only the scene's top/bottom constraints that the original just
-    // installed (they leave a 44pt gap for the bar); keep the bar's own
-    // height constraint untouched, so the hidden-bar state still works.
-    NSMutableArray *drop = [NSMutableArray array];
+    // Only zero the CONSTANT of the scene's top/bottom constraints that the
+    // original just installed (they leave a 44pt gap for the bar). The
+    // constraints themselves, and the bar's own height constraint, are left
+    // untouched, so the layout structure never changes — the scene simply
+    // extends to the full window and the bar overlays it.
+    BOOL changed = NO;
     for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
         if (c.firstItem == sceneView &&
             (c.firstAttribute == NSLayoutAttributeTop || c.firstAttribute == NSLayoutAttributeBottom)) {
-            [drop addObject:c];
+            if (c.constant != 0) {
+                c.constant = 0;
+                changed = YES;
+            }
         }
     }
-    if (drop.count == 0) return;
-    [UIView animateWithDuration:0.3 animations:^{
-        [NSLayoutConstraint deactivateConstraints:drop];
-        [NSLayoutConstraint activateConstraints:@[
-            [sceneView.topAnchor constraintEqualToAnchor:vc.view.topAnchor],
-            [sceneView.bottomAnchor constraintEqualToAnchor:vc.view.bottomAnchor]
-        ]];
-        [vc.view layoutIfNeeded];
-    }];
+    if (changed) {
+        [UIView animateWithDuration:0.3 animations:^{
+            [vc.view layoutIfNeeded];
+        }];
+    }
 }
 
 __attribute__((constructor))
