@@ -188,6 +188,22 @@
 // alone: the floating window does not fill the screen, so its top
 // edge is not the status bar.
 //
+// v20 notes (2026-10-25): user accepts v19 (top + pill fixed) and
+// asks for windowed-mode polish: device-like rounded corners and
+// a draggable window (currently undraggable — the stripped bar is
+// invisible, so there is no affordance to grab). Two changes, both
+// windowed-only. (1) Corners: the maximized pass sets masksToBounds
+// NO, which persisted into windowed mode and made the corners look
+// square by letting content paint past them; windowed mode now
+// restores masksToBounds YES and sets cornerRadius to the device's
+// own display corner radius (via _displayCornerRadius KVC, fallback
+// 28), so the floating window matches the handset. (2) Drag bar:
+// an iPad-style capsule (40x5, gray, in an 80x28 hit area) at the
+// top center of the window, shown only when windowed, re-centered
+// on every layout pass; its pan reuses MultitaskFloatDragWindow:
+// (moveWindow: moves the window directly when not maximized).
+// The pill is kept on top so window controls win on overlap.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -284,6 +300,7 @@ static BOOL dockSwizzled = NO;
 // having them block the app's own controls. Stored on the VC.
 static const char kMultitaskFloatPillKey = 0;
 static const char kMultitaskFloatPillPlacedKey = 0;
+static const char kMultitaskFloatDragBarKey = 0;
 
 // Forward declaration: defined after InitImpl, used by it.
 static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
@@ -578,6 +595,22 @@ static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc);
 // Called from updateVerticalConstraints (covers maximize/restore and bar
 // toggles) and from viewDidAppear (covers first appearance, when the
 // window and the dock are guaranteed to exist — the v6 lesson).
+// Device display corner radius (the handset's own screen corners),
+// for windowed-mode window corners. Read once via KVC; falls back
+// to 28 when the key is unavailable.
+static CGFloat MultitaskFloatDeviceCornerRadius(void) {
+    static CGFloat cached = -1;
+    if (cached >= 0) return cached;
+    CGFloat radius = 28;
+    @try {
+        NSNumber *cr = [[UIScreen mainScreen] valueForKey:@"_displayCornerRadius"];
+        if (cr && cr.doubleValue > 0) radius = cr.doubleValue;
+    } @catch (NSException *e) {
+    }
+    cached = radius;
+    return radius;
+}
+
 static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
     MultitaskFloatStripBar(vc);
     UIView *sceneView = vc.appSceneVC.view;
@@ -617,9 +650,17 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
             // shifted above the decorated view's top edge is cut off
             // exactly there: the strip stays, and the cut reads as a
             // hard line at the top. Let the scene paint past the top
-            // edge under the status bar. Windowed mode is left alone
-            // so a floating window keeps its rounded corners.
+            // edge under the status bar.
             vc.view.layer.masksToBounds = NO;
+        } else {
+            // Windowed: device-like rounded corners, with clipping
+            // restored (the maximized pass sets masksToBounds NO,
+            // which otherwise persists into windowed mode and makes
+            // the corners look square by letting content paint past
+            // them). The radius is the device's own display corner
+            // radius, so the floating window matches the handset.
+            vc.view.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
+            vc.view.layer.masksToBounds = YES;
         }
         BOOL changed = NO;
         for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
@@ -707,6 +748,42 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
             c.x = fmax(b.origin.x + pw + 4, fmin(c.x, b.origin.x + b.size.width - pw - 4));
             c.y = fmax(minY, fmin(c.y, bottomY));
             pill.center = c;
+        }
+    }
+    // Windowed drag bar (iPad-style): a small capsule at the top
+    // center for dragging the floating window, shown only when
+    // windowed (maximized fills the screen and needs no drag
+    // handle). Created lazily; re-centered on every layout pass
+    // so it tracks resizes. The pan reuses MultitaskFloatDragWindow:
+    // (which restores if maximized, then calls moveWindow:), and
+    // in windowed mode moveWindow: moves the window directly.
+    // The pill is kept on top so window controls win when the two
+    // overlap at the top center.
+    UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
+    if (!dragBar && vc.view) {
+        UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 80, 28)];
+        container.backgroundColor = [UIColor clearColor];
+        UIView *capsule = [[UIView alloc] initWithFrame:CGRectMake(20, 11.5, 40, 5)];
+        capsule.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.5];
+        capsule.layer.cornerRadius = 2.5;
+        capsule.layer.masksToBounds = YES;
+        [container addSubview:capsule];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:vc action:@selector(MultitaskFloatDragWindow:)];
+        pan.minimumNumberOfTouches = 1;
+        pan.maximumNumberOfTouches = 1;
+        [container addGestureRecognizer:pan];
+        [vc.view addSubview:container];
+        objc_setAssociatedObject(vc, &kMultitaskFloatDragBarKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        dragBar = container;
+    }
+    if (dragBar) {
+        dragBar.hidden = vc.isMaximized;
+        if (!vc.isMaximized && vc.view) {
+            CGRect b = vc.view.bounds;
+            dragBar.center = CGPointMake(b.origin.x + b.size.width / 2, b.origin.y + 22);
+            [vc.view bringSubviewToFront:dragBar];
+            UIView *pillTop = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
+            if (pillTop) [vc.view bringSubviewToFront:pillTop];
         }
     }
     // Keep the pill's maximize icon in step with the window state.
