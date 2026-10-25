@@ -38,22 +38,19 @@
 //    creation's dock state inconsistent), the dock is hidden through the
 //    supported hideDockToSide path, and only the re-show paths are redirected.
 //
-// v5 notes (root cause, proven by the 2026-10-25 13:49 crash log): v3 and
-// v4 did NOT crash on constraints or on the dock-hide path. The log shows
-// a Swift fatalError (doesNotRecognizeSelector on SwiftObject) from a
-// message send inside this tweak during multitask window creation, and
-// disassembly of the delivered dylib proves the crashing send is
-// [foundClass shared] (selector ref 0xc090). Upstream confirms the real
-// MultitaskDockManager is NSObject-derived with @objc shared, so that send
-// is only fatal when the class lookup returns the WRONG class. The old
-// lookup matched by substring, but the ObjC class list also holds
-// pure-Swift types whose mangled runtime names contain the substring, and
-// the first match wins — sending +shared to one of those is the crash.
-// v5 therefore looks the class up by exact name (or module-prefixed
-// suffix) and refuses to message any class that is not NSObject-derived
-// or does not answer +shared; hideDockToSide is likewise only sent when
-// the class actually implements it. If verification fails, the dock is
-// left alone instead of crashing the app.
+// v6 notes: v5 stopped the crash (user confirmed 2026-10-25 14:04), two
+// finish issues remain. (1) Status bar strip stays white: the decorated
+// view itself starts below the status bar (safe-area inset) and its
+// background is systemBackground, so the band above it is white. Fix:
+// shift the scene's top constraint up by exactly the decorated view's
+// top offset within its window, so the app paints under the status bar;
+// the nav bar and its three buttons stay where they are, floating over
+// the app. (2) Dock "hidden" is not gone: hideDockToSide only moves the
+// dock to the side and deliberately leaves a ~40pt sliver visible at 0.4
+// opacity as an edge-swipe handle. Fix: also hide the dock's hosting
+// view itself (hidden survives updateDockFrame's frame resets); re-show
+// attempts come back through ForceHideDock and are re-hidden. If the
+// dock view appears late, the layout hook re-applies the full hide.
 //
 // Safety (learned the hard way with AutoDarkIcon): the constructor runs at
 // dyld init, before UIKit is ready. It does ONLY pure runtime calls
@@ -119,8 +116,36 @@ static Class MultitaskFloatDockManagerClass(void) {
 }
 
 // Any path that would bring the dock back is redirected to hide it again.
+static void MultitaskFloatHideDockManager(id manager) {
+    if (!manager) return;
+    @try {
+        ((void (*)(id, SEL))objc_msgSend)(manager, @selector(hideDockToSide));
+        // hideDockToSide alone leaves a ~40pt sliver on screen; hide the
+        // hosting view itself for a true removal. hidden survives the
+        // frame resets updateDockFrame performs.
+        id hc = [manager valueForKey:@"hostingController"];
+        UIView *dockView = hc ? [hc valueForKey:@"view"] : nil;
+        if (dockView && !dockView.hidden) dockView.hidden = YES;
+    } @catch (id e) {
+        // Dock hiding is cosmetic; never let it take the app down.
+    }
+}
+
+static void MultitaskFloatHideDockFully(void) {
+    Class cls = MultitaskFloatDockManagerClass();
+    if (!cls) return;
+    if (!class_getInstanceMethod(cls, @selector(hideDockToSide))) return;
+    id manager = nil;
+    @try {
+        manager = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(shared));
+    } @catch (id e) {
+        manager = nil;
+    }
+    MultitaskFloatHideDockManager(manager);
+}
+
 static void MultitaskFloatForceHideDock(id self, SEL _cmd) {
-    ((void (*)(id, SEL))objc_msgSend)(self, @selector(hideDockToSide));
+    MultitaskFloatHideDockManager(self);
 }
 
 static void MultitaskFloatSwizzleDock(void) {
@@ -135,20 +160,6 @@ static void MultitaskFloatSwizzleDock(void) {
     Method mToggle = class_getInstanceMethod(cls, @selector(toggleDockVisibility));
     if (mToggle) method_setImplementation(mToggle, (IMP)MultitaskFloatForceHideDock);
     dockSwizzled = YES;
-}
-
-static void MultitaskFloatHideDockToSide(void) {
-    Class cls = MultitaskFloatDockManagerClass();
-    if (!cls) return;
-    // Only send hideDockToSide when the class actually implements it;
-    // otherwise leave the dock alone instead of crashing.
-    if (!class_getInstanceMethod(cls, @selector(hideDockToSide))) return;
-    @try {
-        id manager = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(shared));
-        if (manager) ((void (*)(id, SEL))objc_msgSend)(manager, @selector(hideDockToSide));
-    } @catch (id e) {
-        // Dock hiding is cosmetic; never let it take the app down.
-    }
 }
 
 static void MultitaskFloatStripBar(DecoratedAppSceneViewController *vc) {
@@ -174,7 +185,7 @@ static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSStri
         // Dock: make sure the re-show redirects are in place, and move the
         // dock off-screen through the supported path.
         MultitaskFloatSwizzleDock();
-        MultitaskFloatHideDockToSide();
+        MultitaskFloatHideDockFully();
     }
     return vc;
 }
@@ -186,17 +197,27 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
     MultitaskFloatStripBar(vc);
     UIView *sceneView = vc.appSceneVC.view;
     if (!sceneView || !vc.view) return;
-    // Only zero the CONSTANT of the scene's top/bottom constraints that the
-    // original just installed (they leave a 44pt gap for the bar). The
-    // constraints themselves, and the bar's own height constraint, are left
-    // untouched, so the layout structure never changes — the scene simply
-    // extends to the full window and the bar overlays it.
+    // Only change the CONSTANTs of the scene's top/bottom constraints
+    // that the original just installed. The constraints themselves, and
+    // the bar's own height constraint, are left untouched, so the layout
+    // structure never changes. Top: the decorated view starts below the
+    // status bar (safe-area inset), which leaves a white strip at the
+    // top; shift the scene up by exactly the decorated view's top offset
+    // within its window so the app itself paints under the status bar.
+    // Bottom stays at the decorated view's bottom edge. The bar keeps
+    // overlaying the scene, so the three buttons stay floating over the
+    // app exactly where they are.
+    CGFloat topOffset = 0;
+    if (vc.view.window) {
+        topOffset = [vc.view convertRect:vc.view.bounds toView:vc.view.window].origin.y;
+    }
     BOOL changed = NO;
     for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
         if (c.firstItem == sceneView &&
             (c.firstAttribute == NSLayoutAttributeTop || c.firstAttribute == NSLayoutAttributeBottom)) {
-            if (c.constant != 0) {
-                c.constant = 0;
+            CGFloat target = (c.firstAttribute == NSLayoutAttributeTop) ? -topOffset : 0;
+            if (c.constant != target) {
+                c.constant = target;
                 changed = YES;
             }
         }
@@ -206,6 +227,8 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
             [vc.view layoutIfNeeded];
         }];
     }
+    // Keep the dock fully gone even if its view appears late.
+    MultitaskFloatHideDockFully();
 }
 
 __attribute__((constructor))
