@@ -741,9 +741,17 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     }
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
     if (!dragBar) {
-        UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 88, 30)];
+        // v41: enlarged hit area (160x44, meets the 44pt minimum tap
+        // target height; was 88x30, too hard to hit). The visible
+        // capsule stays 48x6, recentered in the bigger container, so
+        // the look is unchanged — only the invisible tap area grows.
+        // Both the drag pan and the double-tap pin live on this
+        // container, so one change eases both. Width stays moderate
+        // (not full-width) and centered, so the app's top-left/right
+        // buttons stay tappable; top-center is usually just a title.
+        UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 160, 44)];
         container.backgroundColor = [UIColor clearColor];
-        UIView *capsule = [[UIView alloc] initWithFrame:CGRectMake(20, 12, 48, 6)];
+        UIView *capsule = [[UIView alloc] initWithFrame:CGRectMake(56, 19, 48, 6)];
         capsule.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.65];
         capsule.layer.cornerRadius = 3;
         capsule.layer.masksToBounds = YES;
