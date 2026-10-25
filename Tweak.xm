@@ -172,6 +172,22 @@
 // may briefly start high and then drop to normal when the delayed
 // recompute lands; that is expected.
 //
+// v19 notes (2026-10-25): user confirms v18 fixes the top, but on
+// first open the pill lands in the status bar and has to be dragged
+// down by hand. Cause: the pill is placed once, before the window
+// safe area and view origin are final, so it lands at the view's
+// top edge; the every-layout resize clamp only enforced the view
+// bounds, which already contains the top edge, so it never moved
+// the pill out of the status bar. Fixed by adding a status-bar
+// floor to both the layout clamp and the drag clamp (maximized
+// only): pill center.y must stay at or below windowSafeAreaTop -
+// viewOriginY + half pill height + 4 in view coords. The delayed
+// recompute runs with final values, so the pill auto-drops below
+// the status bar without a manual drag (it may still briefly sit
+// in the status bar for the first 0.5s). Windowed mode is left
+// alone: the floating window does not fill the screen, so its top
+// edge is not the status bar.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -471,12 +487,21 @@ static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sen
     // windowed) and untappable.
     CGRect allowed = vc.view.bounds;
     CGFloat hw = pill.bounds.size.width / 2, hh = pill.bounds.size.height / 2;
+    // Status-bar floor in maximized mode (same as the layout
+    // clamp): the pill must stay below the status bar, not just
+    // inside the view bounds, or it ends up overlapping the status
+    // bar and has to be dragged down by hand.
+    CGFloat minCenterY = allowed.origin.y + hh;
+    if (vc.isMaximized && vc.view.window) {
+        CGFloat floorY = vc.view.window.safeAreaInsets.top - vc.view.frame.origin.y;
+        if (floorY > allowed.origin.y) minCenterY = fmax(minCenterY, floorY + hh + 4);
+    }
     if (sender.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [sender translationInView:vc.view];
         [sender setTranslation:CGPointZero inView:vc.view];
         CGPoint c = CGPointMake(pill.center.x + t.x, pill.center.y + t.y);
         c.x = fmax(allowed.origin.x + hw, fmin(c.x, allowed.origin.x + allowed.size.width - hw));
-        c.y = fmax(allowed.origin.y + hh, fmin(c.y, allowed.origin.y + allowed.size.height - hh));
+        c.y = fmax(minCenterY, fmin(c.y, allowed.origin.y + allowed.size.height - hh));
         pill.center = c;
     } else if (sender.state == UIGestureRecognizerStateEnded || sender.state == UIGestureRecognizerStateCancelled) {
         // Dock to the nearest left/right edge on release, keep the height.
@@ -651,14 +676,36 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
     // Resize clamp: after a maximize/restore the view's bounds change
     // but a placed pill keeps its old center, which can end up
     // outside the smaller windowed view (clipped and untappable).
-    // Pull it back inside on every layout pass.
+    // Pull it back inside on every layout pass. In maximized mode
+    // also enforce a status-bar floor: the bounds clamp alone
+    // allows the pill at the view's top edge, which is window y = 0
+    // when the bar is hidden — inside the status bar. On first
+    // open the pill is placed before the window safe area and view
+    // origin are final, so it lands at the top edge and the bounds
+    // clamp never moves it (it is already in bounds), leaving it
+    // in the status bar until the user drags it down by hand (the
+    // v18 first-open pill bug). The floor in view coords is
+    // windowSafeAreaTop - viewOriginY; it is only trusted once
+    // the window has a real safe area (before that it is 0 and
+    // the bounds floor already applies). The delayed recompute
+    // (0.5s) runs with final values, so the pill auto-drops below
+    // the status bar without a manual drag. Windowed mode is left
+    // alone: the floating window does not fill the screen, so its
+    // top edge is not the status bar.
     if (pill && vc.view) {
         CGRect b = vc.view.bounds;
         if (b.size.width > pill.bounds.size.width && b.size.height > pill.bounds.size.height) {
             CGFloat pw = pill.bounds.size.width / 2, ph = pill.bounds.size.height / 2;
+            CGFloat bottomY = b.origin.y + b.size.height - ph - 4;
+            CGFloat minY = b.origin.y + ph + 4;
+            if (vc.isMaximized && vc.view.window) {
+                CGFloat floorY = vc.view.window.safeAreaInsets.top - vc.view.frame.origin.y;
+                if (floorY > b.origin.y) minY = fmax(minY, floorY + ph + 4);
+            }
+            minY = fmin(minY, bottomY);
             CGPoint c = pill.center;
             c.x = fmax(b.origin.x + pw + 4, fmin(c.x, b.origin.x + b.size.width - pw - 4));
-            c.y = fmax(b.origin.y + ph + 4, fmin(c.y, b.origin.y + b.size.height - ph - 4));
+            c.y = fmax(minY, fmin(c.y, bottomY));
             pill.center = c;
         }
     }
