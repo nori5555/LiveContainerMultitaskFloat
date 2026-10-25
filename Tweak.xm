@@ -1510,19 +1510,17 @@ static UIEdgeInsets MultitaskFloatMaximizedSafeArea(id self, SEL _cmd, UIMutable
 // in its long-press menu (runApp with the opposite mode), but reaching
 // it costs a long-press plus a menu tap. The dot surfaces a multitask
 // launch as one tap, per app: each row's VC gets its own dot, so it
-// scrolls with its row and always launches its own row's app — the
-// display name is read fresh from the row's name label on every tap,
-// so a reused VC still launches the app it currently shows.
+// scrolls with its row and always launches its own row's app — it
+// taps the row's own Launch control, so a reused VC still launches
+// the app it currently shows (no per-app state on the dot itself).
 //
-// Why the dot calls LCUtils directly: the Swift runApp(multitask:)
-// is async and not @objc, so ObjC cannot call it. LCUtils is ObjC,
-// and launchMultitaskGuestApp:completionHandler: is exactly what
-// runApp's non-JIT multitask path calls. Consequence, stated
-// honestly: apps that need JIT get launched WITHOUT the follow-up
-// JIT step runApp performs, so for those apps (row shows the purple
-// JIT badge) the dot may open the app without JIT — they should keep
-// using Launch or the long-press menu. Ordinary apps do not need JIT
-// and launch the same way.
+// v43: the dot NO LONGER calls LCUtils directly (that was v42, and it
+// crashed: skipping runApp's setup let a nil container reach the
+// window init, and AppScene init crashed building a dictionary).
+// The dot now goes through the official path (see DotTapped): flip
+// the global multitask-launch default, tap the row's own Launch, and
+// restore the default. That also fixes the v42 JIT limitation — JIT
+// apps now get runApp's full JIT step via the dot, like via Launch.
 
 // v42: LCAppBannerViewController is a Swift class; its ObjC runtime
 // name is module-prefixed (e.g. "LiveContainer.LCAppBannerViewController").
@@ -1554,32 +1552,9 @@ static Class MultitaskFloatBannerClass(void) {
     return Nil;
 }
 
-// v42: the row's app display name is the name label's text
-// (update() sets nameLabel.text = model.displayName, the same value
-// runApp passes to launchMultitaskGuestApp). Find it without touching
-// Swift properties: walk the banner view, skipping UIControl subtrees
-// (the Launch control's title label is also 16pt bold, so a plain
-// largest-font search would tie with "启动"). Among the remaining
-// plain labels, the name (16pt bold) beats version (12), remark (10)
-// and container (8). Returns nil if nothing is found.
-static NSString *MultitaskFloatBannerDisplayName(UIView *root) {
-    if (!root) return nil;
-    NSString *best = nil;
-    CGFloat bestSize = 0;
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
-    while (stack.count > 0) {
-        UIView *v = [stack lastObject];
-        [stack removeLastObject];
-        if ([v isKindOfClass:[UIControl class]]) continue;
-        if ([v isKindOfClass:[UILabel class]]) {
-            UILabel *label = (UILabel *)v;
-            CGFloat size = label.font ? label.font.pointSize : 0;
-            if (label.text && label.text.length > 0 && size > bestSize) { bestSize = size; best = label.text; }
-        }
-        for (UIView *sub in v.subviews) [stack addObject:sub];
-    }
-    return best;
-}
+// v43: the display-name helper was removed — the dot no longer
+// launches directly, so it no longer needs the row's display name
+// (see DotTapped).
 
 // v42: the Launch control is the banner view's only original UIControl
 // direct subview. This search runs in viewDidLoad before the dot is
@@ -1592,11 +1567,20 @@ static UIControl *MultitaskFloatBannerRunControl(UIView *bannerView) {
     return nil;
 }
 
-// v42: dot tap — launch this row's app in multitask mode.
-// Debounced (a double-tap would otherwise launch twice), and the
-// display name is read fresh from the row so a reused VC launches
-// the app it currently shows. Calls LCUtils (ObjC) directly, because
-// the Swift runApp(multitask:) is async and not @objc.
+// v43: dot tap — launch this row's app in multitask mode via the
+// OFFICIAL path, not a direct launch call. v42 called LCUtils
+// directly and skipped runApp's setup (container creation, JIT,
+// locked check), so for an app without a ready container LCUtils
+// passed nil into the window init and AppScene init crashed building
+// a dictionary (attempt to insert nil). The fix: temporarily turn on
+// the global multitask-launch default, tap the row's own Launch
+// control (which runs the full runApp path), then restore the
+// setting. The flag is read synchronously at runApp's start, so
+// restoring after 1.5s is far beyond the race window; the only side
+// effect is that another app launched within those 1.5s would also
+// open in multitask. Per-app explicit never-multitask still overrides
+// the global flag (rare; those apps keep launching normally via the
+// dot). Debounced (a double-tap would otherwise launch twice).
 static void MultitaskFloatDotTapped(id self, SEL _cmd, UIButton *sender) {
     (void)_cmd;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
@@ -1604,18 +1588,21 @@ static void MultitaskFloatDotTapped(id self, SEL _cmd, UIButton *sender) {
     if (last && now - [last doubleValue] < 1.5) return;
     objc_setAssociatedObject(sender, &kMultitaskFloatDotTapTimeKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIViewController *vc = (UIViewController *)self;
-    NSString *displayName = MultitaskFloatBannerDisplayName(vc.view);
-    if (!displayName || displayName.length == 0) return;
-    Class lcUtils = objc_getClass("LCUtils");
-    if (!lcUtils) return;
-    SEL sel = @selector(launchMultitaskGuestApp:completionHandler:);
-    if (![lcUtils respondsToSelector:sel]) return;
-    @try {
-        ((void (*)(id, SEL, NSString *, void (^)(NSNumber *, NSError *)))objc_msgSend)(
-            lcUtils, sel, displayName, ^(NSNumber *pid, NSError *error) {
-                (void)pid; (void)error;
-            });
-    } @catch (id e) {}
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL wasOn = [defaults boolForKey:@"LCLaunchInMultitaskMode"];
+    if (!wasOn) [defaults setBool:YES forKey:@"LCLaunchInMultitaskMode"];
+    // Trigger the row's own Launch (official path). runButtonTapped
+    // is @objc, so it is callable from ObjC even though it is private
+    // in Swift. If the app is already open in multitask, Launch brings
+    // its window forward and returns early — same as tapping Launch.
+    if ([vc respondsToSelector:@selector(runButtonTapped)]) {
+        ((void (*)(id, SEL))objc_msgSend)(vc, @selector(runButtonTapped));
+    }
+    if (!wasOn) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [defaults setBool:NO forKey:@"LCLaunchInMultitaskMode"];
+        });
+    }
 }
 
 // v42: add the per-app multitask dot after the host sets the row up.
