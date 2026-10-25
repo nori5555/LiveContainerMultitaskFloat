@@ -1035,21 +1035,25 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         popCover.userInteractionEnabled = NO;
         [vc.view.superview insertSubview:popCover belowSubview:vc.view];
     }
-    // v38: handwriting animation (the user asked: "can't the
-    // animation appear like a person writing?"). Instead of
-    // sliding whole letters in (v37), each glyph's outline
-    // path (from CoreText, same Snell Roundhand / fallback
-    // chain) is drawn progressively with a CAShapeLayer
-    // strokeEnd animation, glyph by glyph, left to right —
-    // like a pen tracing the letters. In the superview above
-    // vc.view, so it masks the guest content pop-in like the
-    // earlier layers did. Day -> black stroke, night -> white
-    // stroke (foreground contrast, like the pill border).
-    // The container fades out and is removed after the
-    // writing finishes, so it can never outlive the animation
-    // even if the window closes mid-flight.
+    // v39: filled-stroke reveal (the user corrected v38:
+    // "only a thin white line follows the stroke, I want
+    // the strokes themselves to present slowly"). v38 stroked
+    // the glyph outline with a 2pt line, so you only saw a
+    // thin trace, never the ink. v39 fills each glyph (the
+    // actual calligraphic ink shape, from CoreText, same
+    // Snell Roundhand / fallback chain) and reveals it
+    // progressively left to right inside a clipping view,
+    // glyph by glyph — so the stroke itself grows, not just
+    // its outline. In the superview above vc.view, so it
+    // masks the guest content pop-in like the earlier layers
+    // did. Day -> black ink, night -> white ink (foreground
+    // contrast, like the pill border). The container fades
+    // out and is removed after the writing finishes, so it
+    // can never outlive the animation even if the window
+    // closes mid-flight.
     UIView *nameContainer = nil;
-    NSMutableArray *nameLayers = nil;
+    NSMutableArray *nameClips = nil;
+    NSMutableArray *nameClipWidths = nil;
     if (vc.isMaximized && vc.view.superview) {
         UIFont *nameFont = [UIFont fontWithName:@"Snell Roundhand" size:34];
         if (!nameFont) nameFont = [UIFont fontWithName:@"Bradley Hand" size:34];
@@ -1061,6 +1065,7 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         if (ctFont) {
             CGFloat ascent = CTFontGetAscent(ctFont);
             CGFloat descent = CTFontGetDescent(ctFont);
+            CGFloat containerHeight = ascent + descent;
             CGFloat totalWidth = 0;
             for (NSUInteger i = 0; i < pluginName.length; i++) {
                 UniChar ch = (UniChar)[pluginName characterAtIndex:i];
@@ -1071,12 +1076,13 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
                     totalWidth += advance.width;
                 }
             }
-            nameContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, totalWidth, ascent + descent)];
+            nameContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, totalWidth, containerHeight)];
             nameContainer.backgroundColor = [UIColor clearColor];
             nameContainer.userInteractionEnabled = NO;
             nameContainer.center = CGPointMake(CGRectGetMidX(vc.view.superview.bounds), CGRectGetMidY(vc.view.superview.bounds));
             nameContainer.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-            nameLayers = [NSMutableArray array];
+            nameClips = [NSMutableArray array];
+            nameClipWidths = [NSMutableArray array];
             CGFloat runningX = 0;
             for (NSUInteger i = 0; i < pluginName.length; i++) {
                 UniChar ch = (UniChar)[pluginName characterAtIndex:i];
@@ -1086,22 +1092,31 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
                     CTFontGetAdvancesForGlyphs(ctFont, kCTFontOrientationHorizontal, &glyph, &advance, 1);
                     CGPathRef glyphPath = CTFontCreatePathForGlyph(ctFont, glyph, NULL);
                     if (glyphPath) {
-                        CGAffineTransform glyphTransform = CGAffineTransformMake(1, 0, 0, -1, runningX, ascent);
+                        // Clip view starts at width 0 and widens to
+                        // the full glyph width, revealing the filled
+                        // ink left to right. A 2pt margin each side
+                        // keeps script overhang from being cut off.
+                        CGFloat clipX = runningX - 2;
+                        CGFloat clipWidth = advance.width + 4;
+                        UIView *clipView = [[UIView alloc] initWithFrame:CGRectMake(clipX, 0, 0, containerHeight)];
+                        clipView.backgroundColor = [UIColor clearColor];
+                        clipView.userInteractionEnabled = NO;
+                        clipView.clipsToBounds = YES;
+                        CGAffineTransform glyphTransform = CGAffineTransformMake(1, 0, 0, -1, 2, ascent);
                         CGPathRef transformedPath = CGPathCreateCopyByTransformingPath(glyphPath, &glyphTransform);
                         if (transformedPath) {
-                            CAShapeLayer *strokeLayer = [CAShapeLayer layer];
-                            strokeLayer.path = transformedPath;
-                            strokeLayer.strokeColor = nameColor.CGColor;
-                            strokeLayer.fillColor = [UIColor clearColor].CGColor;
-                            strokeLayer.lineWidth = 2.0;
-                            strokeLayer.lineCap = kCALineCapRound;
-                            strokeLayer.lineJoin = kCALineJoinRound;
-                            strokeLayer.strokeEnd = 0;
-                            [nameContainer.layer addSublayer:strokeLayer];
-                            [nameLayers addObject:strokeLayer];
+                            CAShapeLayer *inkLayer = [CAShapeLayer layer];
+                            inkLayer.frame = CGRectMake(0, 0, clipWidth, containerHeight);
+                            inkLayer.path = transformedPath;
+                            inkLayer.fillColor = nameColor.CGColor;
+                            inkLayer.strokeColor = [UIColor clearColor].CGColor;
+                            [clipView.layer addSublayer:inkLayer];
                             CGPathRelease(transformedPath);
                         }
                         CGPathRelease(glyphPath);
+                        [nameContainer addSubview:clipView];
+                        [nameClips addObject:clipView];
+                        [nameClipWidths addObject:@(clipWidth)];
                     }
                 }
                 runningX += advance.width;
@@ -1166,25 +1181,24 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
             }];
         }
     }];
-    // v38: writing animation: each glyph's outline draws
-    // progressively (strokeEnd 0 -> 1 over 0.16s), staggered
-    // 0.10s apart, left to right (14 glyphs -> last one
-    // finishes at ~1.46s), concurrent with the pop. Then
+    // v39: filled-stroke reveal: each glyph's filled ink
+    // widens left to right over 0.22s (the clip view's width
+    // grows from 0 to the full glyph width), staggered
+    // 0.12s apart, left to right (14 glyphs -> last one
+    // finishes at ~1.78s), concurrent with the pop. Then
     // the whole container fades out over 0.15s and is
-    // removed (~1.6s total), so it lingers a bit after the
-    // pop settles.
+    // removed (~1.9s total), so the strokes present slowly
+    // and linger a bit after the pop settles.
     if (nameContainer) {
-        for (NSUInteger i = 0; i < nameLayers.count; i++) {
-            CAShapeLayer *strokeLayer = nameLayers[i];
-            strokeLayer.strokeEnd = 1;
-            CABasicAnimation *writeAnim = [CABasicAnimation animationWithKeyPath:@"strokeEnd"];
-            writeAnim.fromValue = @0;
-            writeAnim.toValue = @1;
-            writeAnim.duration = 0.16;
-            writeAnim.beginTime = CACurrentMediaTime() + (i * 0.10);
-            [strokeLayer addAnimation:writeAnim forKey:@"MultitaskFloatWrite"];
+        for (NSUInteger i = 0; i < nameClips.count; i++) {
+            UIView *clipView = nameClips[i];
+            CGFloat targetWidth = [nameClipWidths[i] floatValue];
+            CGRect clipFrame = clipView.frame;
+            [UIView animateWithDuration:0.22 delay:(i * 0.12) options:UIViewAnimationOptionCurveEaseOut animations:^{
+                clipView.frame = CGRectMake(clipFrame.origin.x, clipFrame.origin.y, targetWidth, clipFrame.size.height);
+            } completion:nil];
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.46 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.78 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
                 nameContainer.alpha = 0;
             } completion:^(BOOL nameFinished) {
