@@ -115,6 +115,21 @@
 // pushed from ApplyLayout so it covers maximize as well as
 // appearance.
 //
+// v15 notes (2026-10-25): user on v14 reports minimize works but
+// the top still slides up, and after shrinking to windowed mode the
+// pill runs outside the app and cannot be tapped. Pill cause: a
+// placed pill keeps its maximized coordinates after a resize, and
+// ApplyLayout never re-clamped it, so in the smaller windowed view
+// it sits outside the bounds where it is clipped (masksToBounds YES
+// when windowed) and untappable; PillPan's maximized allowed rect
+// also extended past the view's top edge. Fixed by clamping the
+// pill to the decorated view's own bounds on every layout pass and
+// in PillPan. Top hardening: off is now the max of the window safe
+// area and the frame origin (a 0 from either source can no longer
+// zero it), and the swizzle uses max instead of += so it cannot
+// double-add when the nav bar is already hidden (the original then
+// supplies the full top inset itself).
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -405,12 +420,13 @@ static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sen
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
     UIView *pill = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
     if (!pill || !vc.view) return;
-    CGRect allowed;
-    if (vc.isMaximized && vc.view.window) {
-        allowed = [vc.view convertRect:vc.view.window.bounds fromView:vc.view.window];
-    } else {
-        allowed = vc.view.bounds;
-    }
+    // Always clamp to the decorated view's own bounds (the tappable
+    // area): in maximized mode the old window-bounds rect extended
+    // past the view's top edge, and after a shrink to windowed mode
+    // a pill placed in maximized coordinates can sit outside the
+    // smaller view, where it is clipped (masksToBounds YES when
+    // windowed) and untappable.
+    CGRect allowed = vc.view.bounds;
     CGFloat hw = pill.bounds.size.width / 2, hh = pill.bounds.size.height / 2;
     if (sender.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [sender translationInView:vc.view];
@@ -505,8 +521,13 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
             UIWindowScene *ws = vc.view.window.windowScene;
             if (ws) portrait = UIInterfaceOrientationIsPortrait(ws.interfaceOrientation);
             // Timing-independent (see the swizzle): the final origin.y
-            // equals the window's top safe-area inset.
-            if (portrait) topOffset = vc.view.window.safeAreaInsets.top;
+            // equals the window's top safe-area inset. Take the max
+            // of that and the current frame origin so a 0 from either
+            // source at first recompute cannot zero the extension.
+            if (portrait) {
+                CGFloat frameOff = [vc.view convertRect:vc.view.bounds toView:vc.view.window].origin.y;
+                topOffset = fmax(vc.view.window.safeAreaInsets.top, frameOff);
+            }
         }
         if (maximized) {
             // The decorated view clips subviews to its bounds
@@ -570,6 +591,20 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
         pill.alpha = 1.0;
         objc_setAssociatedObject(vc, &kMultitaskFloatPillPlacedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    // Resize clamp: after a maximize/restore the view's bounds change
+    // but a placed pill keeps its old center, which can end up
+    // outside the smaller windowed view (clipped and untappable).
+    // Pull it back inside on every layout pass.
+    if (pill && vc.view) {
+        CGRect b = vc.view.bounds;
+        if (b.size.width > pill.bounds.size.width && b.size.height > pill.bounds.size.height) {
+            CGFloat pw = pill.bounds.size.width / 2, ph = pill.bounds.size.height / 2;
+            CGPoint c = pill.center;
+            c.x = fmax(b.origin.x + pw + 4, fmin(c.x, b.origin.x + b.size.width - pw - 4));
+            c.y = fmax(b.origin.y + ph + 4, fmin(c.y, b.origin.y + b.size.height - ph - 4));
+            pill.center = c;
+        }
+    }
     // Keep the pill's maximize icon in step with the window state.
     MultitaskFloatSyncPill(vc);
     // Push the compensated safe area (covers appearance AND maximize:
@@ -609,7 +644,10 @@ static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc) {
         if (!portrait) return;
         // Timing-independent (see the swizzle): use the window's top
         // safe-area inset, not the view's current frame origin.
-        CGFloat off = w.safeAreaInsets.top;
+        // Take the max of both so a 0 from either source cannot
+        // zero the compensation.
+        CGFloat frameOff = [vc.view convertRect:vc.view.bounds toView:w].origin.y;
+        CGFloat off = fmax(w.safeAreaInsets.top, frameOff);
         if (off <= 0) return;
         CGFloat scale = 1.0;
         @try {
@@ -705,8 +743,13 @@ static UIEdgeInsets MultitaskFloatMaximizedSafeArea(id self, SEL _cmd, UIMutable
         // sets maxFrame by insetting the window frame by it), but the
         // view's current frame may not be final yet when this runs
         // (setup/activation), which used to yield off = 0. The window
-        // safe area is final from window creation.
-        CGFloat off = w.safeAreaInsets.top;
+        // safe area is final from window creation. Take the max of
+        // both so a 0 from either source cannot zero the value.
+        // Use max (not +=): when the nav bar is hidden the original
+        // already supplies the full top inset, and adding again
+        // would double it.
+        CGFloat frameOff = [vc.view convertRect:vc.view.bounds toView:w].origin.y;
+        CGFloat off = fmax(w.safeAreaInsets.top, frameOff);
         if (portrait && off > 0) {
             CGFloat scale = 1.0;
             @try {
@@ -716,10 +759,10 @@ static UIEdgeInsets MultitaskFloatMaximizedSafeArea(id self, SEL _cmd, UIMutable
             } @catch (id e) {}
             CGFloat add = off / scale;
             UIEdgeInsets p = settings.peripheryInsets;
-            p.top += add;
+            p.top = fmax(p.top, add);
             settings.peripheryInsets = p;
             UIEdgeInsets pa = settings.safeAreaInsetsPortrait;
-            pa.top += add;
+            pa.top = fmax(pa.top, add);
             settings.safeAreaInsetsPortrait = pa;
         }
     }
