@@ -85,6 +85,14 @@
 // (maximizeWindow, without animation) and then moves it like
 // moveWindow: does. When not maximized the delegate refuses, so the
 // original gesture moves the window exactly as before.
+// v8 notes: v7 loaded fine (user restarted and re-signed) but the strip
+// stayed with a hard cut edge at the top. Cause: the decorated view
+// clips subviews to its bounds (cornerRadius 10, masksToBounds YES),
+// and the scene is a plain subview of it, so the part of the scene
+// shifted above the decorated view's top edge is cut off exactly
+// there — the extension never paints, and the cut reads as a hard
+// line. v8 turns masksToBounds off while maximized so the scene can
+// paint past the decorated view's top edge under the status bar.
 
 // Minimal interface: only what this tweak touches. The real headers pull in
 // private headers or are Swift-generated, so they cannot be imported here.
@@ -248,6 +256,17 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
             topOffset = [vc.view convertRect:vc.view.bounds toView:vc.view.window].origin.y;
             UIWindowScene *ws = vc.view.window.windowScene;
             if (ws) portrait = UIInterfaceOrientationIsPortrait(ws.interfaceOrientation);
+        }
+        if (maximized) {
+            // The decorated view clips subviews to its bounds
+            // (cornerRadius 10, masksToBounds YES), and the scene is a
+            // plain subview of it. Without this, the part of the scene
+            // shifted above the decorated view's top edge is cut off
+            // exactly there: the strip stays, and the cut reads as a
+            // hard line at the top. Let the scene paint past the top
+            // edge under the status bar. Windowed mode is left alone
+            // so a floating window keeps its rounded corners.
+            vc.view.layer.masksToBounds = NO;
         }
         BOOL changed = NO;
         for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
