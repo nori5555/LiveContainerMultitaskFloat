@@ -38,6 +38,23 @@
 //    creation's dock state inconsistent), the dock is hidden through the
 //    supported hideDockToSide path, and only the re-show paths are redirected.
 //
+// v5 notes (root cause, proven by the 2026-10-25 13:49 crash log): v3 and
+// v4 did NOT crash on constraints or on the dock-hide path. The log shows
+// a Swift fatalError (doesNotRecognizeSelector on SwiftObject) from a
+// message send inside this tweak during multitask window creation, and
+// disassembly of the delivered dylib proves the crashing send is
+// [foundClass shared] (selector ref 0xc090). Upstream confirms the real
+// MultitaskDockManager is NSObject-derived with @objc shared, so that send
+// is only fatal when the class lookup returns the WRONG class. The old
+// lookup matched by substring, but the ObjC class list also holds
+// pure-Swift types whose mangled runtime names contain the substring, and
+// the first match wins — sending +shared to one of those is the crash.
+// v5 therefore looks the class up by exact name (or module-prefixed
+// suffix) and refuses to message any class that is not NSObject-derived
+// or does not answer +shared; hideDockToSide is likewise only sent when
+// the class actually implements it. If verification fails, the dock is
+// left alone instead of crashing the app.
+//
 // Safety (learned the hard way with AutoDarkIcon): the constructor runs at
 // dyld init, before UIKit is ready. It does ONLY pure runtime calls
 // (class lookup, method swizzles). All UIKit work happens later, when
@@ -66,21 +83,39 @@ static DecoratedInitIMP origDecoratedInit = NULL;
 static VoidIMP origUpdateVerticalConstraints = NULL;
 static BOOL dockSwizzled = NO;
 
-// MultitaskDockManager is a Swift class; its ObjC runtime name may carry
-// the module prefix, so look it up by substring instead of exact name.
+// MultitaskDockManager is a Swift class; its ObjC runtime name is either
+// the bare name or module-prefixed (e.g. "LiveContainerSwiftUI.
+// MultitaskDockManager"). Look it up by exact name first, then by
+// module-prefixed suffix — never by substring, because the class list
+// also holds pure-Swift types whose mangled names contain the substring,
+// and messaging one of those crashes (see v5 notes above). Accept only a
+// class that is NSObject-derived and answers +shared.
 static Class MultitaskFloatDockManagerClass(void) {
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return Nil;
-    Class *list = (Class *)malloc(sizeof(Class) * (size_t)count);
-    if (!list) return Nil;
-    count = objc_getClassList(list, count);
-    Class found = Nil;
-    for (int i = 0; i < count; i++) {
-        const char *name = class_getName(list[i]);
-        if (name && strstr(name, "MultitaskDockManager") != NULL) { found = list[i]; break; }
+    Class cls = objc_getClass("MultitaskDockManager");
+    if (!cls) {
+        int count = objc_getClassList(NULL, 0);
+        if (count <= 0) return Nil;
+        Class *list = (Class *)malloc(sizeof(Class) * (size_t)count);
+        if (!list) return Nil;
+        count = objc_getClassList(list, count);
+        const char *suffix = ".MultitaskDockManager";
+        size_t slen = strlen(suffix);
+        for (int i = 0; i < count; i++) {
+            const char *name = class_getName(list[i]);
+            if (!name) continue;
+            size_t nlen = strlen(name);
+            if (nlen > slen && strcmp(name + nlen - slen, suffix) == 0) { cls = list[i]; break; }
+        }
+        free(list);
     }
-    free(list);
-    return found;
+    if (!cls) return Nil;
+    BOOL isNSObjectDerived = NO;
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        if (strcmp(class_getName(c), "NSObject") == 0) { isNSObjectDerived = YES; break; }
+    }
+    if (!isNSObjectDerived) return Nil;
+    if (!class_respondsToSelector(cls, @selector(shared))) return Nil;
+    return cls;
 }
 
 // Any path that would bring the dock back is redirected to hide it again.
@@ -92,6 +127,9 @@ static void MultitaskFloatSwizzleDock(void) {
     if (dockSwizzled) return;
     Class cls = MultitaskFloatDockManagerClass();
     if (!cls) return;
+    // Only redirect the re-show paths when the hide path actually exists,
+    // so the redirect never sends an unimplemented selector.
+    if (!class_getInstanceMethod(cls, @selector(hideDockToSide))) return;
     Method mShow = class_getInstanceMethod(cls, @selector(showDockFromHidden));
     if (mShow) method_setImplementation(mShow, (IMP)MultitaskFloatForceHideDock);
     Method mToggle = class_getInstanceMethod(cls, @selector(toggleDockVisibility));
@@ -102,8 +140,15 @@ static void MultitaskFloatSwizzleDock(void) {
 static void MultitaskFloatHideDockToSide(void) {
     Class cls = MultitaskFloatDockManagerClass();
     if (!cls) return;
-    id manager = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(shared));
-    if (manager) ((void (*)(id, SEL))objc_msgSend)(manager, @selector(hideDockToSide));
+    // Only send hideDockToSide when the class actually implements it;
+    // otherwise leave the dock alone instead of crashing.
+    if (!class_getInstanceMethod(cls, @selector(hideDockToSide))) return;
+    @try {
+        id manager = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(shared));
+        if (manager) ((void (*)(id, SEL))objc_msgSend)(manager, @selector(hideDockToSide));
+    } @catch (id e) {
+        // Dock hiding is cosmetic; never let it take the app down.
+    }
 }
 
 static void MultitaskFloatStripBar(DecoratedAppSceneViewController *vc) {
