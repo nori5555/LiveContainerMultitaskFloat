@@ -7,6 +7,6 @@ TWEAK_NAME := MultitaskFloat
 
 MultitaskFloat_FILES := Tweak.xm
 MultitaskFloat_CFLAGS := -fobjc-arc
-MultitaskFloat_FRAMEWORKS := UIKit
+MultitaskFloat_FRAMEWORKS := UIKit CoreText
 
 include $(THEOS_MAKE_PATH)/tweak.mk

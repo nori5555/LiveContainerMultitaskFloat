@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <CoreText/CoreText.h>  // v38: glyph paths for the handwriting animation
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
@@ -1034,22 +1035,21 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         popCover.userInteractionEnabled = NO;
         [vc.view.superview insertSubview:popCover belowSubview:vc.view];
     }
-    // v37: handwritten plugin-name text (the user replaced the
-    // v36 circle: "still a bit not good-looking, switch to a
-    // handwritten artistic font, strokes sliding past one by
-    // one, and call it the plugin name"). One UILabel per
-    // character of "MultitaskFloat", in the superview above
+    // v38: handwriting animation (the user asked: "can't the
+    // animation appear like a person writing?"). Instead of
+    // sliding whole letters in (v37), each glyph's outline
+    // path (from CoreText, same Snell Roundhand / fallback
+    // chain) is drawn progressively with a CAShapeLayer
+    // strokeEnd animation, glyph by glyph, left to right —
+    // like a pen tracing the letters. In the superview above
     // vc.view, so it masks the guest content pop-in like the
-    // circle/logo did. Font: Snell Roundhand (system script),
-    // falling back to Bradley Hand, then Marker Felt, then the
-    // italic system font. Day -> black text, night -> white
-    // text (foreground contrast, like the pill border).
-    // Letters slide in one by one, left to right (see below),
-    // then the whole container fades out and is removed, so
-    // it can never outlive the animation even if the window
-    // closes mid-flight.
+    // earlier layers did. Day -> black stroke, night -> white
+    // stroke (foreground contrast, like the pill border).
+    // The container fades out and is removed after the
+    // writing finishes, so it can never outlive the animation
+    // even if the window closes mid-flight.
     UIView *nameContainer = nil;
-    NSMutableArray *nameLabels = nil;
+    NSMutableArray *nameLayers = nil;
     if (vc.isMaximized && vc.view.superview) {
         UIFont *nameFont = [UIFont fontWithName:@"Snell Roundhand" size:34];
         if (!nameFont) nameFont = [UIFont fontWithName:@"Bradley Hand" size:34];
@@ -1057,33 +1057,58 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         if (!nameFont) nameFont = [UIFont italicSystemFontOfSize:34];
         NSString *pluginName = @"MultitaskFloat";
         UIColor *nameColor = (vc.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? [UIColor whiteColor] : [UIColor blackColor];
-        CGFloat totalWidth = 0;
-        for (NSUInteger i = 0; i < pluginName.length; i++) {
-            NSString *ch = [pluginName substringWithRange:NSMakeRange(i, 1)];
-            totalWidth += [ch sizeWithAttributes:@{NSFontAttributeName: nameFont}].width;
+        CTFontRef ctFont = CTFontCreateWithName((CFStringRef)nameFont.fontName, 34, NULL);
+        if (ctFont) {
+            CGFloat ascent = CTFontGetAscent(ctFont);
+            CGFloat descent = CTFontGetDescent(ctFont);
+            CGFloat totalWidth = 0;
+            for (NSUInteger i = 0; i < pluginName.length; i++) {
+                UniChar ch = (UniChar)[pluginName characterAtIndex:i];
+                CGGlyph glyph = 0;
+                if (CTFontGetGlyphsForCharacters(ctFont, &ch, &glyph, 1)) {
+                    CGSize advance = CGSizeZero;
+                    CTFontGetAdvancesForGlyphs(ctFont, kCTFontOrientationHorizontal, &glyph, &advance, 1);
+                    totalWidth += advance.width;
+                }
+            }
+            nameContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, totalWidth, ascent + descent)];
+            nameContainer.backgroundColor = [UIColor clearColor];
+            nameContainer.userInteractionEnabled = NO;
+            nameContainer.center = CGPointMake(CGRectGetMidX(vc.view.superview.bounds), CGRectGetMidY(vc.view.superview.bounds));
+            nameContainer.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+            nameLayers = [NSMutableArray array];
+            CGFloat runningX = 0;
+            for (NSUInteger i = 0; i < pluginName.length; i++) {
+                UniChar ch = (UniChar)[pluginName characterAtIndex:i];
+                CGGlyph glyph = 0;
+                CGSize advance = CGSizeZero;
+                if (CTFontGetGlyphsForCharacters(ctFont, &ch, &glyph, 1)) {
+                    CTFontGetAdvancesForGlyphs(ctFont, kCTFontOrientationHorizontal, &glyph, &advance, 1);
+                    CGPathRef glyphPath = CTFontCreatePathForGlyph(ctFont, glyph, NULL);
+                    if (glyphPath) {
+                        CGAffineTransform glyphTransform = CGAffineTransformMake(1, 0, 0, -1, runningX, ascent);
+                        CGPathRef transformedPath = CGPathCreateCopyByTransformingPath(glyphPath, &glyphTransform);
+                        if (transformedPath) {
+                            CAShapeLayer *strokeLayer = [CAShapeLayer layer];
+                            strokeLayer.path = transformedPath;
+                            strokeLayer.strokeColor = nameColor.CGColor;
+                            strokeLayer.fillColor = [UIColor clearColor].CGColor;
+                            strokeLayer.lineWidth = 2.0;
+                            strokeLayer.lineCap = kCALineCapRound;
+                            strokeLayer.lineJoin = kCALineJoinRound;
+                            strokeLayer.strokeEnd = 0;
+                            [nameContainer.layer addSublayer:strokeLayer];
+                            [nameLayers addObject:strokeLayer];
+                            CGPathRelease(transformedPath);
+                        }
+                        CGPathRelease(glyphPath);
+                    }
+                }
+                runningX += advance.width;
+            }
+            CFRelease(ctFont);
+            [vc.view.superview addSubview:nameContainer];
         }
-        nameContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, totalWidth, nameFont.lineHeight)];
-        nameContainer.backgroundColor = [UIColor clearColor];
-        nameContainer.userInteractionEnabled = NO;
-        nameContainer.center = CGPointMake(CGRectGetMidX(vc.view.superview.bounds), CGRectGetMidY(vc.view.superview.bounds));
-        nameContainer.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-        nameLabels = [NSMutableArray array];
-        CGFloat runningX = 0;
-        for (NSUInteger i = 0; i < pluginName.length; i++) {
-            NSString *ch = [pluginName substringWithRange:NSMakeRange(i, 1)];
-            CGFloat chWidth = [ch sizeWithAttributes:@{NSFontAttributeName: nameFont}].width;
-            UILabel *letter = [[UILabel alloc] initWithFrame:CGRectMake(runningX, 0, chWidth, nameFont.lineHeight)];
-            letter.backgroundColor = [UIColor clearColor];
-            letter.font = nameFont;
-            letter.textColor = nameColor;
-            letter.text = ch;
-            letter.alpha = 0;
-            letter.transform = CGAffineTransformMakeTranslation(-30, 0);
-            [nameContainer addSubview:letter];
-            [nameLabels addObject:letter];
-            runningX += chWidth;
-        }
-        [vc.view.superview addSubview:nameContainer];
     }
     [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:0 animations:^{
         view.alpha = 1;
@@ -1141,21 +1166,25 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
             }];
         }
     }];
-    // v37: letters slide in one by one, left to right: each
-    // letter slides from 30pt left + fades in over 0.2s,
-    // staggered 0.05s apart (14 letters -> last one lands at
-    // ~0.85s), concurrent with the pop. Then the whole
-    // container fades out over 0.15s and is removed (~1.0s
-    // total), so it lingers a bit after the pop settles.
+    // v38: writing animation: each glyph's outline draws
+    // progressively (strokeEnd 0 -> 1 over 0.16s), staggered
+    // 0.10s apart, left to right (14 glyphs -> last one
+    // finishes at ~1.46s), concurrent with the pop. Then
+    // the whole container fades out over 0.15s and is
+    // removed (~1.6s total), so it lingers a bit after the
+    // pop settles.
     if (nameContainer) {
-        for (NSUInteger i = 0; i < nameLabels.count; i++) {
-            UILabel *letter = nameLabels[i];
-            [UIView animateWithDuration:0.2 delay:(i * 0.05) options:UIViewAnimationOptionCurveEaseOut animations:^{
-                letter.alpha = 1;
-                letter.transform = CGAffineTransformIdentity;
-            } completion:nil];
+        for (NSUInteger i = 0; i < nameLayers.count; i++) {
+            CAShapeLayer *strokeLayer = nameLayers[i];
+            strokeLayer.strokeEnd = 1;
+            CABasicAnimation *writeAnim = [CABasicAnimation animationWithKeyPath:@"strokeEnd"];
+            writeAnim.fromValue = @0;
+            writeAnim.toValue = @1;
+            writeAnim.duration = 0.16;
+            writeAnim.beginTime = CACurrentMediaTime() + (i * 0.10);
+            [strokeLayer addAnimation:writeAnim forKey:@"MultitaskFloatWrite"];
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.85 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.46 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
                 nameContainer.alpha = 0;
             } completion:^(BOOL nameFinished) {
