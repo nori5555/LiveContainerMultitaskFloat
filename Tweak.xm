@@ -611,13 +611,26 @@ static void MultitaskFloatAddFloatingPill(DecoratedAppSceneViewController *vc) {
     pill.layer.shadowOpacity = 0.15;
     pill.layer.shadowRadius = 8;
     pill.layer.shadowOffset = CGSizeMake(0, 2);
-    // Glass background, v26: SystemMaterial was too opaque on white
-    // app backgrounds and read as a solid chip (the video's pill).
-    // UltraThinMaterial is genuinely see-through, so the app content
-    // behind blurs through and the pill reads as glass. The effect
-    // view sits behind the buttons, follows the pill's bounds, and
-    // never intercepts touches (buttons and the drag pan keep working).
-    UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial]];
+    // Liquid glass (v28): the user wants liquid glass, not frosted
+    // blur — UltraThinMaterial still reads as a frosted chip. Use
+    // iOS 26 UIGlassEffect via runtime lookup (no compile-time
+    // dependency, so older SDKs still build), with an ultra-thin
+    // blur fallback on systems without it. The effect view sits
+    // behind the buttons, follows the pill's bounds, and never
+    // intercepts touches (buttons and the drag pan keep working).
+    UIVisualEffect *glassEffect = nil;
+    Class liquidCls = NSClassFromString(@"UIGlassEffect");
+    if (liquidCls) {
+        SEL glassSel = NSSelectorFromString(@"glassEffect");
+        if ([liquidCls respondsToSelector:glassSel]) {
+            id (*liquidMsgSend)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+            glassEffect = liquidMsgSend((id)liquidCls, glassSel);
+        }
+    }
+    if (!glassEffect) {
+        glassEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
+    }
+    UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:glassEffect];
     glass.frame = pill.bounds;
     glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     glass.layer.cornerRadius = pillH / 2;
