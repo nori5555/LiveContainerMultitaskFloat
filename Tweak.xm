@@ -742,6 +742,28 @@ static void MultitaskFloatBringPinnedToFront(void) {
     }
 }
 
+// v46: rounded-rect layer mask, independent of cornerRadius/
+// masksToBounds. Instagram and Xiaohongshu still show square
+// corners on v45 (confirmed installed): the host must be resetting
+// the decorated view's AND the scene view's clipping without a
+// layout pass (media-heavy apps reconfigure their scene on
+// activation/video/rotation), so a layout-triggered re-sync never
+// runs. layer.mask is a separate property the host never touches
+// in setup/maximize/minimize, so it keeps clipping to the rounded
+// rect between syncs. Guarded to non-empty bounds: a mask built
+// from a zero rect would clip the view to nothing (invisible).
+static void MultitaskFloatApplyCornerMask(UIView *view, CGFloat radius) {
+    if (!view) return;
+    if (radius <= 0 || CGRectGetWidth(view.bounds) <= 0 || CGRectGetHeight(view.bounds) <= 0) {
+        view.layer.mask = nil;
+        return;
+    }
+    CAShapeLayer *mask = [CAShapeLayer layer];
+    mask.frame = view.bounds;
+    mask.path = [UIBezierPath bezierPathWithRoundedRect:view.bounds cornerRadius:radius].CGPath;
+    view.layer.mask = mask;
+}
+
 static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) {
     if (!vc.view) return;
     // During the open animation (v29) the window's corners are part
@@ -773,6 +795,19 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
                 sceneView.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
                 sceneView.layer.masksToBounds = YES;
             }
+        }
+        // v46: layer mask on both views (see helper). Maximized
+        // clears it (square full-screen); small-window sets it to
+        // the device radius. Left untouched while animatingOpen
+        // (the pop animates cornerRadius itself; a rounded mask
+        // would freeze it rounded and snap square at completion).
+        if (vc.isMaximized) {
+            MultitaskFloatApplyCornerMask(vc.view, 0);
+            MultitaskFloatApplyCornerMask(sceneView, 0);
+        } else {
+            CGFloat deviceRadius = MultitaskFloatDeviceCornerRadius();
+            MultitaskFloatApplyCornerMask(vc.view, deviceRadius);
+            MultitaskFloatApplyCornerMask(sceneView, deviceRadius);
         }
     }
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
