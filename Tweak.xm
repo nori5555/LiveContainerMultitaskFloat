@@ -1029,6 +1029,17 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         if (vc.view.window) {
             MultitaskFloatSyncWindowChrome(vc);
         }
+        // v30: full recompute once the pop ends and the transform is
+        // identity. ApplyLayout at appear ran with intermediate bounds
+        // and a scale transform, so the scene/safe-area geometry could
+        // be wrong (top blocked, bottom cut) until the 0.5s timer
+        // fixed it — the current symptom. Recomputing here (host
+        // orig + ApplyLayout via the updateVerticalConstraints
+        // swizzle) settles geometry at pop end instead of leaving a
+        // visible snap for later. The 0.5s block stays as a safety net.
+        if (vc.view.window) {
+            [vc updateVerticalConstraints];
+        }
     }];
 }
 
@@ -1087,6 +1098,13 @@ static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc) {
     AppSceneViewController *appVC = vc.appSceneVC;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!vc.isMaximized || !vc.view.window) return;
+        // v30: during the open pop the view carries a scale transform,
+        // so convertRect below would return a transformed origin and
+        // commit a wrong top inset (top blocked / bottom cut until a
+        // later recompute fixes it — the current symptom). Skip while
+        // the pop is running; the pop-completion and 0.5s recomputes
+        // set it with an identity transform.
+        if (!CGAffineTransformIsIdentity(vc.view.transform)) return;
         UIWindow *w = vc.view.window;
         BOOL portrait = YES;
         if (w.windowScene) portrait = UIInterfaceOrientationIsPortrait(w.windowScene.interfaceOrientation);
