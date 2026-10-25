@@ -1034,31 +1034,56 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         popCover.userInteractionEnabled = NO;
         [vc.view.superview insertSubview:popCover belowSubview:vc.view];
     }
-    // v35: simple circle ripple (the user replaced the v34 logo:
-    // "not good-looking, a simple circle is fine, disappearing
-    // like a ripple, day and night sets"). A ring (clear fill,
-    // stroked border) in the superview above vc.view, so it masks
-    // the guest content pop-in like the logo did. Day -> black
-    // border, night -> white border (foreground contrast, like
-    // the pill border — opposite of the background-matching
-    // cover). Starts at 0.5x and expands to 3.5x while fading
-    // out over 0.6s (ease-out, v36: was 0.45s), concurrent with the shortened
-    // pop. Removed in its own completion, so it can never
-    // outlive the animation even if the window closes
-    // mid-flight.
-    UIView *circleView = nil;
+    // v37: handwritten plugin-name text (the user replaced the
+    // v36 circle: "still a bit not good-looking, switch to a
+    // handwritten artistic font, strokes sliding past one by
+    // one, and call it the plugin name"). One UILabel per
+    // character of "MultitaskFloat", in the superview above
+    // vc.view, so it masks the guest content pop-in like the
+    // circle/logo did. Font: Snell Roundhand (system script),
+    // falling back to Bradley Hand, then Marker Felt, then the
+    // italic system font. Day -> black text, night -> white
+    // text (foreground contrast, like the pill border).
+    // Letters slide in one by one, left to right (see below),
+    // then the whole container fades out and is removed, so
+    // it can never outlive the animation even if the window
+    // closes mid-flight.
+    UIView *nameContainer = nil;
+    NSMutableArray *nameLabels = nil;
     if (vc.isMaximized && vc.view.superview) {
-        CGFloat circleSize = 120;
-        circleView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, circleSize, circleSize)];
-        circleView.backgroundColor = [UIColor clearColor];
-        circleView.userInteractionEnabled = NO;
-        circleView.layer.cornerRadius = circleSize * 0.5;
-        circleView.layer.borderWidth = 4.0;  // v36: bolder (was 2.5)
-        circleView.layer.borderColor = (vc.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? [UIColor whiteColor].CGColor : [UIColor blackColor].CGColor;
-        circleView.center = CGPointMake(CGRectGetMidX(vc.view.superview.bounds), CGRectGetMidY(vc.view.superview.bounds));
-        circleView.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-        circleView.transform = CGAffineTransformMakeScale(0.5, 0.5);
-        [vc.view.superview addSubview:circleView];
+        UIFont *nameFont = [UIFont fontWithName:@"Snell Roundhand" size:34];
+        if (!nameFont) nameFont = [UIFont fontWithName:@"Bradley Hand" size:34];
+        if (!nameFont) nameFont = [UIFont fontWithName:@"Marker Felt" size:34];
+        if (!nameFont) nameFont = [UIFont italicSystemFontOfSize:34];
+        NSString *pluginName = @"MultitaskFloat";
+        UIColor *nameColor = (vc.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? [UIColor whiteColor] : [UIColor blackColor];
+        CGFloat totalWidth = 0;
+        for (NSUInteger i = 0; i < pluginName.length; i++) {
+            NSString *ch = [pluginName substringWithRange:NSMakeRange(i, 1)];
+            totalWidth += [ch sizeWithAttributes:@{NSFontAttributeName: nameFont}].width;
+        }
+        nameContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, totalWidth, nameFont.lineHeight)];
+        nameContainer.backgroundColor = [UIColor clearColor];
+        nameContainer.userInteractionEnabled = NO;
+        nameContainer.center = CGPointMake(CGRectGetMidX(vc.view.superview.bounds), CGRectGetMidY(vc.view.superview.bounds));
+        nameContainer.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+        nameLabels = [NSMutableArray array];
+        CGFloat runningX = 0;
+        for (NSUInteger i = 0; i < pluginName.length; i++) {
+            NSString *ch = [pluginName substringWithRange:NSMakeRange(i, 1)];
+            CGFloat chWidth = [ch sizeWithAttributes:@{NSFontAttributeName: nameFont}].width;
+            UILabel *letter = [[UILabel alloc] initWithFrame:CGRectMake(runningX, 0, chWidth, nameFont.lineHeight)];
+            letter.backgroundColor = [UIColor clearColor];
+            letter.font = nameFont;
+            letter.textColor = nameColor;
+            letter.text = ch;
+            letter.alpha = 0;
+            letter.transform = CGAffineTransformMakeTranslation(-30, 0);
+            [nameContainer addSubview:letter];
+            [nameLabels addObject:letter];
+            runningX += chWidth;
+        }
+        [vc.view.superview addSubview:nameContainer];
     }
     [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:0 animations:^{
         view.alpha = 1;
@@ -1116,18 +1141,28 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
             }];
         }
     }];
-    // v35: circle ripple expand + fade (concurrent with the
-    // pop, not after it, so it adds no extra time).
-    // v36: duration 0.45 -> 0.6s (the user asked for a longer
-    // ripple, so it lingers a bit after the pop settles).
-    if (circleView) {
-        [UIView animateWithDuration:0.6 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-            circleView.transform = CGAffineTransformMakeScale(3.5, 3.5);
-            circleView.alpha = 0;
-        } completion:^(BOOL circleFinished) {
-            (void)circleFinished;
-            [circleView removeFromSuperview];
-        }];
+    // v37: letters slide in one by one, left to right: each
+    // letter slides from 30pt left + fades in over 0.2s,
+    // staggered 0.05s apart (14 letters -> last one lands at
+    // ~0.85s), concurrent with the pop. Then the whole
+    // container fades out over 0.15s and is removed (~1.0s
+    // total), so it lingers a bit after the pop settles.
+    if (nameContainer) {
+        for (NSUInteger i = 0; i < nameLabels.count; i++) {
+            UILabel *letter = nameLabels[i];
+            [UIView animateWithDuration:0.2 delay:(i * 0.05) options:UIViewAnimationOptionCurveEaseOut animations:^{
+                letter.alpha = 1;
+                letter.transform = CGAffineTransformIdentity;
+            } completion:nil];
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.85 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+                nameContainer.alpha = 0;
+            } completion:^(BOOL nameFinished) {
+                (void)nameFinished;
+                [nameContainer removeFromSuperview];
+            }];
+        });
     }
 }
 
