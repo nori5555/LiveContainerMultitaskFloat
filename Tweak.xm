@@ -1017,9 +1017,10 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     // night — the user corrected v31 here, a black cover is wrong
     // in daytime.
     // Maximized only: in windowed mode the list around the small
-    // window is supposed to be visible. At pop end the view fills
-    // the window, so the cover is already fully hidden behind it and
-    // removing it causes no visual change. No touches: the cover
+    // window is supposed to be visible. At pop end (after the
+    // recompute in the completion below) the view fills the
+    // window, so the cover is already fully hidden behind it and
+    // fading it out causes no visual change. No touches: the cover
     // never intercepts (the pop is 0.4s and the buttons stay above).
     UIView *popCover = nil;
     if (vc.isMaximized && vc.view.superview) {
@@ -1039,10 +1040,6 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         view.layer.cornerRadius = finalRadius;
     } completion:^(BOOL finished) {
         (void)finished;
-        // v31: drop the pop cover (no-op when there is none, e.g.
-        // windowed mode). Done first and unconditionally so a cover
-        // can never outlive the pop, even if the window is gone.
-        [popCover removeFromSuperview];
         objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // Restore the default anchor (invisible: transform is identity).
         CALayer *l = view.layer;
@@ -1069,6 +1066,27 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         // visible snap for later. The 0.5s block stays as a safety net.
         if (vc.view.window) {
             [vc updateVerticalConstraints];
+        }
+        // v33: fade the pop cover out instead of dropping it
+        // instantly (the user called the instant removal stiff).
+        // Two changes vs v31/v32: (1) the cover now outlives the
+        // recompute above, so the view fills the window BEFORE
+        // the cover goes away — removing it first exposed the
+        // list in any not-yet-settled gap as a snap; (2) it
+        // fades (0.25s ease-out) instead of vanishing, so any
+        // still-visible part dissolves instead of snapping. If
+        // the view already fills the window, the cover is fully
+        // hidden behind it and the fade is invisible. The fade's
+        // own completion removes it, so it can never outlive the
+        // fade even if the window closes mid-fade. No-op when
+        // there is no cover (e.g. windowed mode).
+        if (popCover) {
+            [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+                popCover.alpha = 0;
+            } completion:^(BOOL fadeFinished) {
+                (void)fadeFinished;
+                [popCover removeFromSuperview];
+            }];
         }
     }];
 }
