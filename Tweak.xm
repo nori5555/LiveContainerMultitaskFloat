@@ -204,6 +204,21 @@
 // (moveWindow: moves the window directly when not maximized).
 // The pill is kept on top so window controls win on overlap.
 //
+// v21 notes (2026-10-25): user confirms v20 IS installed, yet
+// corners are still square and no capsule appears — a real v20
+// bug, not a stale version. Cause: window chrome lived only in
+// ApplyLayout, which never re-runs after a restore through a path
+// this tweak does not hook (and host layout can reset cornerRadius
+// after ApplyLayout runs), so the window kept its maximized layer
+// state (masksToBounds NO, drag bar hidden) while floating.
+// Fixed by factoring chrome into MultitaskFloatSyncWindowChrome
+// (corners + drag bar, single source of truth) and calling it
+// from viewDidLayoutSubviews as well, so it re-syncs after EVERY
+// layout pass, after the host's layout code; it sets layer flags
+// and positions only, never constraints, so it cannot loop. The
+// capsule is also made conspicuous (48x6, 0.65 alpha, 88x30 hit
+// area) so it cannot be missed.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -292,6 +307,7 @@ typedef BOOL (*GestureShouldBeginIMP)(id, SEL, UIGestureRecognizer *);
 static DecoratedInitIMP origDecoratedInit = NULL;
 static VoidIMP origUpdateVerticalConstraints = NULL;
 static ViewDidAppearIMP origViewDidAppear = NULL;
+static VoidIMP origViewDidLayoutSubviews = NULL;
 static GestureShouldBeginIMP origGestureShouldBegin = NULL;
 static BOOL dockSwizzled = NO;
 
@@ -611,6 +627,46 @@ static CGFloat MultitaskFloatDeviceCornerRadius(void) {
     return radius;
 }
 
+// Window chrome sync (corners + drag bar), called from ApplyLayout
+// and from viewDidLayoutSubviews. Windowed only for corners/drag
+// bar; maximized only clears clipping so the scene can paint past
+// the top edge. The capsule is deliberately conspicuous (48x6,
+// 0.65 alpha) so it cannot be missed.
+static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) {
+    if (!vc.view) return;
+    if (vc.isMaximized) {
+        vc.view.layer.masksToBounds = NO;
+    } else {
+        vc.view.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
+        vc.view.layer.masksToBounds = YES;
+    }
+    UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
+    if (!dragBar) {
+        UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 88, 30)];
+        container.backgroundColor = [UIColor clearColor];
+        UIView *capsule = [[UIView alloc] initWithFrame:CGRectMake(20, 12, 48, 6)];
+        capsule.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.65];
+        capsule.layer.cornerRadius = 3;
+        capsule.layer.masksToBounds = YES;
+        [container addSubview:capsule];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:vc action:@selector(MultitaskFloatDragWindow:)];
+        pan.minimumNumberOfTouches = 1;
+        pan.maximumNumberOfTouches = 1;
+        [container addGestureRecognizer:pan];
+        [vc.view addSubview:container];
+        objc_setAssociatedObject(vc, &kMultitaskFloatDragBarKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        dragBar = container;
+    }
+    dragBar.hidden = vc.isMaximized;
+    if (!vc.isMaximized) {
+        CGRect b = vc.view.bounds;
+        dragBar.center = CGPointMake(b.origin.x + b.size.width / 2, b.origin.y + 22);
+        [vc.view bringSubviewToFront:dragBar];
+        UIView *pillTop = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
+        if (pillTop) [vc.view bringSubviewToFront:pillTop];
+    }
+}
+
 static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
     MultitaskFloatStripBar(vc);
     UIView *sceneView = vc.appSceneVC.view;
@@ -650,17 +706,9 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
             // shifted above the decorated view's top edge is cut off
             // exactly there: the strip stays, and the cut reads as a
             // hard line at the top. Let the scene paint past the top
-            // edge under the status bar.
+            // edge under the status bar. (Window chrome, including
+            // this flag, is synced below via SyncWindowChrome.)
             vc.view.layer.masksToBounds = NO;
-        } else {
-            // Windowed: device-like rounded corners, with clipping
-            // restored (the maximized pass sets masksToBounds NO,
-            // which otherwise persists into windowed mode and makes
-            // the corners look square by letting content paint past
-            // them). The radius is the device's own display corner
-            // radius, so the floating window matches the handset.
-            vc.view.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
-            vc.view.layer.masksToBounds = YES;
         }
         BOOL changed = NO;
         for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
@@ -750,42 +798,12 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
             pill.center = c;
         }
     }
-    // Windowed drag bar (iPad-style): a small capsule at the top
-    // center for dragging the floating window, shown only when
-    // windowed (maximized fills the screen and needs no drag
-    // handle). Created lazily; re-centered on every layout pass
-    // so it tracks resizes. The pan reuses MultitaskFloatDragWindow:
-    // (which restores if maximized, then calls moveWindow:), and
-    // in windowed mode moveWindow: moves the window directly.
-    // The pill is kept on top so window controls win when the two
-    // overlap at the top center.
-    UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
-    if (!dragBar && vc.view) {
-        UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 80, 28)];
-        container.backgroundColor = [UIColor clearColor];
-        UIView *capsule = [[UIView alloc] initWithFrame:CGRectMake(20, 11.5, 40, 5)];
-        capsule.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.5];
-        capsule.layer.cornerRadius = 2.5;
-        capsule.layer.masksToBounds = YES;
-        [container addSubview:capsule];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:vc action:@selector(MultitaskFloatDragWindow:)];
-        pan.minimumNumberOfTouches = 1;
-        pan.maximumNumberOfTouches = 1;
-        [container addGestureRecognizer:pan];
-        [vc.view addSubview:container];
-        objc_setAssociatedObject(vc, &kMultitaskFloatDragBarKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        dragBar = container;
-    }
-    if (dragBar) {
-        dragBar.hidden = vc.isMaximized;
-        if (!vc.isMaximized && vc.view) {
-            CGRect b = vc.view.bounds;
-            dragBar.center = CGPointMake(b.origin.x + b.size.width / 2, b.origin.y + 22);
-            [vc.view bringSubviewToFront:dragBar];
-            UIView *pillTop = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
-            if (pillTop) [vc.view bringSubviewToFront:pillTop];
-        }
-    }
+    // Window chrome (corners + drag bar) is synced here and from
+    // viewDidLayoutSubviews, so it survives host resets and restore
+    // paths that never call ApplyLayout (the v20 windowed bug: both
+    // features were absent even with v20 loaded, because ApplyLayout
+    // never re-ran after a restore through an unhooked path).
+    MultitaskFloatSyncWindowChrome(vc);
     // Keep the pill's maximize icon in step with the window state.
     MultitaskFloatSyncPill(vc);
     // Push the compensated safe area (covers appearance AND maximize:
@@ -838,6 +856,17 @@ static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
             [strongVC updateVerticalConstraints];
         }
     });
+}
+
+// viewDidLayoutSubviews: re-sync window chrome after EVERY layout
+// pass, after the host's layout code. This is the robust path for
+// windowed corners + drag bar: ApplyLayout alone misses restore
+// paths that never call it (and host layout can reset cornerRadius
+// after ApplyLayout runs). This cannot loop: it sets layer flags
+// and view positions only, never constraints or setNeedsLayout.
+static void MultitaskFloatViewDidLayoutSubviews(id self, SEL _cmd) {
+    if (origViewDidLayoutSubviews) origViewDidLayoutSubviews(self, _cmd);
+    MultitaskFloatSyncWindowChrome((DecoratedAppSceneViewController *)self);
 }
 
 // The initial maximized recompute runs before the decorated view's
@@ -1028,6 +1057,15 @@ static void MultitaskFloatConstructor(void) {
         origViewDidAppear = (ViewDidAppearIMP)method_getImplementation(mAppear);
         if (!class_addMethod(cls, @selector(viewDidAppear:), (IMP)MultitaskFloatViewDidAppear, method_getTypeEncoding(mAppear))) {
             method_setImplementation(mAppear, (IMP)MultitaskFloatViewDidAppear);
+        }
+    }
+    // viewDidLayoutSubviews: same pattern; the class does not define
+    // it, so adding an override is safe.
+    Method mLayoutSubviews = class_getInstanceMethod(cls, @selector(viewDidLayoutSubviews));
+    if (mLayoutSubviews) {
+        origViewDidLayoutSubviews = (VoidIMP)method_getImplementation(mLayoutSubviews);
+        if (!class_addMethod(cls, @selector(viewDidLayoutSubviews), (IMP)MultitaskFloatViewDidLayoutSubviews, method_getTypeEncoding(mLayoutSubviews))) {
+            method_setImplementation(mLayoutSubviews, (IMP)MultitaskFloatViewDidLayoutSubviews);
         }
     }
     // Drag-gesture delegate: the class does not define it, so adding it
