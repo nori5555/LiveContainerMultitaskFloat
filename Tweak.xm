@@ -219,6 +219,19 @@
 // capsule is also made conspicuous (48x6, 0.65 alpha, 88x30 hit
 // area) so it cannot be missed.
 //
+// v22 notes (2026-10-25): user on v21 reports no effect at first;
+// only dragging the bottom-right resize handle makes corners +
+// capsule appear. That is decisive: the resize triggers a layout
+// pass (viewDidLayoutSubviews) with final state, while initial
+// appearance / restore runs with stale isMaximized or intermediate
+// bounds and fires no further layout pass until a resize. Fixed by
+// re-syncing chrome once settled: a delayed SyncWindowChrome
+// (0.35s, past the 0.3s toggle animation) in the maximize/minimize
+// swizzles, and in viewDidAppear's existing delayed block (0.5s).
+// Same pattern as the v18 top fix (delayed recompute with final
+// state). The sync sets layer flags + positions only, so it cannot
+// loop, and it is idempotent.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -830,11 +843,31 @@ static VoidIMP origMinimizeWindow = NULL;
 static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
     if (origMaximizeWindow) origMaximizeWindow(self, _cmd);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
+    // Delayed chrome sync: the immediate ApplyLayout can run with a
+    // stale isMaximized or intermediate bounds (the toggle animates
+    // over 0.3s), and restore paths may not fire another layout pass
+    // until the user resizes (the v21 first-open bug: no effect until
+    // the resize handle was dragged). Re-sync once settled.
+    __weak DecoratedAppSceneViewController *weakVC = (DecoratedAppSceneViewController *)self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
 }
 
 static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
     if (origMinimizeWindow) origMinimizeWindow(self, _cmd);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
+    // Same delayed chrome sync as maximize (see above).
+    __weak DecoratedAppSceneViewController *weakVC = (DecoratedAppSceneViewController *)self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
 }
 
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
@@ -854,6 +887,13 @@ static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
         DecoratedAppSceneViewController *strongVC = weakVC;
         if (strongVC && strongVC.view.window && strongVC.isMaximized) {
             [strongVC updateVerticalConstraints];
+        }
+        // Delayed chrome sync for the same settled-state reason as
+        // the toggle swizzles (v21 first-open bug): initial layout
+        // can run with stale state, and no further layout pass fires
+        // until the user resizes.
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
         }
     });
 }
