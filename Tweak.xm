@@ -588,9 +588,22 @@ static void MultitaskFloatAddFloatingPill(DecoratedAppSceneViewController *vc) {
     CGFloat pillW = pad * 2 + btn * 3 + gap * 2;
     CGFloat pillH = 40;
     UIView *pill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pillW, pillH)];
-    pill.backgroundColor = [[UIColor systemBackgroundColor] colorWithAlphaComponent:0.75];
+    pill.backgroundColor = [UIColor clearColor];
     pill.layer.cornerRadius = pillH / 2;
     pill.layer.masksToBounds = YES;
+    pill.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
+    pill.layer.borderWidth = 0.5;
+    // Glass background: blur the app content behind the pill, so the
+    // pill reads as frosted glass instead of a solid chip. The effect
+    // view sits behind the buttons, follows the pill's bounds, and
+    // never intercepts touches (buttons and the drag pan keep working).
+    UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+    glass.frame = pill.bounds;
+    glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    glass.layer.cornerRadius = pillH / 2;
+    glass.clipsToBounds = YES;
+    glass.userInteractionEnabled = NO;
+    [pill insertSubview:glass atIndex:0];
     // Left to right, matching the screenshots: minimize (yellow),
     // maximize (green), close (red). Same symbols, colors and point
     // size as the bar's original buttons.
