@@ -321,6 +321,7 @@ typedef BOOL (*GestureShouldBeginIMP)(id, SEL, UIGestureRecognizer *);
 static DecoratedInitIMP origDecoratedInit = NULL;
 static VoidIMP origUpdateVerticalConstraints = NULL;
 static ViewDidAppearIMP origViewDidAppear = NULL;
+static ViewDidAppearIMP origViewDidDisappear = NULL;
 static VoidIMP origViewDidLayoutSubviews = NULL;
 static GestureShouldBeginIMP origGestureShouldBegin = NULL;
 static BOOL dockSwizzled = NO;
@@ -857,7 +858,9 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     // it mid-pop would leave it floating at the final position while
     // the window is still small; the pop completion re-syncs and it
     // appears in place.
-    dragBar.hidden = vc.isMaximized || animatingOpen;
+    // v47: also hide when the window is gone or hidden (closed /
+    // minimized) so a superview bar never floats over the list.
+    dragBar.hidden = vc.isMaximized || animatingOpen || !vc.view.window || vc.view.hidden;
     if (!vc.isMaximized) {
         // v45: drag bar sits just outside the window's top edge
         // (capsule 3–9pt above it) so it is always grabbable and the
@@ -1375,6 +1378,27 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
                 [nameContainer removeFromSuperview];
             }];
         });
+    }
+}
+
+// v47: clean up the drag bar when the window goes away. v45
+// moved the drag bar to the window's superview (so it can sit
+// above the top edge), but a superview child is NOT removed when
+// the window itself is removed — closing a small window left its
+// drag bar orphaned on the App list (blue = a pinned window's bar,
+// gray = an unpinned one). viewDidDisappear fires when the window
+// closes (and on minimize-if-removed); removing the bar here and
+// clearing the association lets the next SyncWindowChrome recreate
+// it fresh if the window reappears (restore, or a modal cover
+// dismissed), so no bar is lost and none is left behind. The pill
+// needs no cleanup (it lives inside vc.view and goes away with it).
+// Runs after orig, mirroring viewDidAppear's orig-first order.
+static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
+    if (origViewDidDisappear) origViewDidDisappear(self, _cmd, animated);
+    UIView *dragBar = objc_getAssociatedObject(self, &kMultitaskFloatDragBarKey);
+    if (dragBar) {
+        [dragBar removeFromSuperview];
+        objc_setAssociatedObject(self, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
@@ -1903,6 +1927,16 @@ static void MultitaskFloatConstructor(void) {
         origViewDidAppear = (ViewDidAppearIMP)method_getImplementation(mAppear);
         if (!class_addMethod(cls, @selector(viewDidAppear:), (IMP)MultitaskFloatViewDidAppear, method_getTypeEncoding(mAppear))) {
             method_setImplementation(mAppear, (IMP)MultitaskFloatViewDidAppear);
+        }
+    }
+    // viewDidDisappear: same pattern; the class does not define
+    // it, so adding an override is safe. (v47: drag-bar cleanup
+    // when the window goes away — see MultitaskFloatViewDidDisappear.)
+    Method mDisappear = class_getInstanceMethod(cls, @selector(viewDidDisappear:));
+    if (mDisappear) {
+        origViewDidDisappear = (ViewDidAppearIMP)method_getImplementation(mDisappear);
+        if (!class_addMethod(cls, @selector(viewDidDisappear:), (IMP)MultitaskFloatViewDidDisappear, method_getTypeEncoding(mDisappear))) {
+            method_setImplementation(mDisappear, (IMP)MultitaskFloatViewDidDisappear);
         }
     }
     // viewDidLayoutSubviews: same pattern; the class does not define
