@@ -59,6 +59,18 @@
 // No %hook: a %hook build links /Library/Frameworks/CydiaSubstrate, which
 // does not exist on jailed devices, so the tweak would fail to load.
 //
+// v11 notes (build fixes, 2026-10-25): v9 and v10 both failed to build,
+// for two different reasons. (1) v9 used a category @implementation on
+// the host class: it compiled but failed to LINK, because a category
+// references the host class symbol (_OBJC_CLASS_$), which lives in
+// LiveContainer, not in this dylib. (2) v10 had two plain C++ errors:
+// a const object without an initializer (illegal in C++), and a call
+// to AddFloatingPill from InitImpl before its definition (fixed with
+// a forward declaration, as with AddDragGesture). v11 keeps the
+// safe-area compensation but installs it as a C-function IMP with the
+// method's exact UIEdgeInsets signature — no category, no %hook, no
+// CydiaSubstrate, no host class symbol at link time.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -138,9 +150,6 @@
 - (void)updateOriginalFrame;
 @end
 
-@interface DecoratedAppSceneViewController (MultitaskFloatSafeArea)
-- (UIEdgeInsets)MultitaskFloat_updateMaximizedSafeAreaWithSettings:(UIMutableApplicationSceneSettings *)settings;
-@end
 
 typedef id (*DecoratedInitIMP)(id, SEL, NSString *, NSString *, NSString *, UIViewController *);
 typedef void (*VoidIMP)(id, SEL);
@@ -155,8 +164,8 @@ static BOOL dockSwizzled = NO;
 // Floating pill (v10): the three buttons detached from the nav bar so
 // the user can drag them anywhere like AssistiveTouch instead of
 // having them block the app's own controls. Stored on the VC.
-static const char kMultitaskFloatPillKey;
-static const char kMultitaskFloatPillPlacedKey;
+static const char kMultitaskFloatPillKey = 0;
+static const char kMultitaskFloatPillPlacedKey = 0;
 
 // Forward declaration: defined after InitImpl, used by it.
 static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
@@ -256,6 +265,9 @@ static void MultitaskFloatStripBar(DecoratedAppSceneViewController *vc) {
         bar.shadowImage = [UIImage new];
     }
 }
+
+// Forward declaration: defined after InitImpl, used by it.
+static void MultitaskFloatAddFloatingPill(DecoratedAppSceneViewController *vc);
 
 static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSString *bundleId, NSString *dataUUID, UIViewController *rootVC) {
     id vc = origDecoratedInit(self, _cmd, windowName, bundleId, dataUUID, rootVC);
@@ -514,8 +526,17 @@ static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc) {
     [bar addGestureRecognizer:drag];
 }
 
-@implementation DecoratedAppSceneViewController (MultitaskFloatSafeArea)
-
+// Safe-area compensation inside the recompute path. A C-function IMP
+// installed with method_setImplementation (see the constructor): it
+// does NOT link CydiaSubstrate (unlike %hook, which would make the
+// dylib fail to load on a jailed device) and does NOT reference the
+// host class symbol at link time (unlike a category, which failed to
+// link: _OBJC_CLASS_$_DecoratedAppSceneViewController lives in the
+// host, not the dylib). The function is declared with the method's
+// exact signature (UIEdgeInsets return), so on arm64 the compiler
+// generates the same struct-return convention (result address in x8)
+// as a real method — the ABI matches, and the original type encoding
+// is left untouched, so NSInvocation-style callers stay correct too.
 // Runs the original maximized safe-area computation, then grows the
 // guest's top safe area by the same amount the scene was extended
 // upward, so the app's top controls stay where they were and only
@@ -526,22 +547,20 @@ static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc) {
 // original resets the base first and this adds on top each time.
 // The frame insets returned are left untouched: the decorated view
 // itself stays below the status bar; only the scene extends past it.
-// A real ObjC method (not a C-function IMP) so the UIEdgeInsets
-// struct return uses the correct ABI.
-- (UIEdgeInsets)MultitaskFloat_updateMaximizedSafeAreaWithSettings:(UIMutableApplicationSceneSettings *)settings {
-    // After the exchange in the constructor, this selector holds the
-    // original implementation, so this call runs the original
-    // computation.
-    UIEdgeInsets r = [self MultitaskFloat_updateMaximizedSafeAreaWithSettings:settings];
-    if (self.isMaximized && self.view.window) {
-        UIWindow *w = self.view.window;
+typedef UIEdgeInsets (*MaximizedSafeAreaIMP)(id, SEL, UIMutableApplicationSceneSettings *);
+static MaximizedSafeAreaIMP origMaximizedSafeArea;
+static UIEdgeInsets MultitaskFloatMaximizedSafeArea(id self, SEL _cmd, UIMutableApplicationSceneSettings *settings) {
+    UIEdgeInsets r = origMaximizedSafeArea(self, _cmd, settings);
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    if (vc.isMaximized && vc.view.window) {
+        UIWindow *w = vc.view.window;
         BOOL portrait = YES;
         if (w.windowScene) portrait = UIInterfaceOrientationIsPortrait(w.windowScene.interfaceOrientation);
-        CGFloat off = [self.view convertRect:self.view.bounds toView:w].origin.y;
+        CGFloat off = [vc.view convertRect:vc.view.bounds toView:w].origin.y;
         if (portrait && off > 0) {
             CGFloat scale = 1.0;
             @try {
-                NSNumber *n = [self valueForKey:@"scaleRatio"];
+                NSNumber *n = [vc valueForKey:@"scaleRatio"];
                 double v = [n doubleValue];
                 if (v > 0) scale = (CGFloat)v;
             } @catch (id e) {}
@@ -556,8 +575,6 @@ static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc) {
     }
     return r;
 }
-
-@end
 
 __attribute__((constructor))
 static void MultitaskFloatConstructor(void) {
@@ -576,14 +593,13 @@ static void MultitaskFloatConstructor(void) {
         origUpdateVerticalConstraints = (VoidIMP)method_getImplementation(mLayout);
         method_setImplementation(mLayout, (IMP)MultitaskFloatUpdateVerticalConstraints);
     }
-    // Safe-area compensation inside the recompute path (see the
-    // category above). The category is attached at load time, so both
-    // methods exist here; after the exchange, the category selector
-    // holds the original implementation.
+    // Safe-area compensation inside the recompute path (see above):
+    // swap the method's implementation for the C function; the
+    // original IMP is kept and called first.
     Method mSafe = class_getInstanceMethod(cls, @selector(updateMaximizedSafeAreaWithSettings:));
-    Method mMine = class_getInstanceMethod(cls, @selector(MultitaskFloat_updateMaximizedSafeAreaWithSettings:));
-    if (mSafe && mMine) {
-        method_exchangeImplementations(mSafe, mMine);
+    if (mSafe) {
+        origMaximizedSafeArea = (MaximizedSafeAreaIMP)method_getImplementation(mSafe);
+        method_setImplementation(mSafe, (IMP)MultitaskFloatMaximizedSafeArea);
     }
     // viewDidAppear: the class does not define it, so adding an override
     // is safe; chain to UIViewController's implementation.
