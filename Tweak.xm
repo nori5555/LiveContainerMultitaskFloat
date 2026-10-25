@@ -130,6 +130,17 @@
 // double-add when the nav bar is already hidden (the original then
 // supplies the full top inset itself).
 //
+// v16 notes (2026-10-25): user screenshots (16:13, map app) show
+// the pill still half outside the windowed window's right edge and
+// the maximized search bar still under the status bar. The v15
+// clamp lives in ApplyLayout, but ApplyLayout only runs from
+// updateVerticalConstraints, which the host calls from the
+// maximized branch (and setup/bar toggle) — never on restore to
+// windowed or on minimize — so the clamp never fired on shrink.
+// Fixed by swizzling maximizeWindow and minimizeWindow to run the
+// layout pass after the original, so the clamp (and safe-area fix)
+// apply on both directions of every window-state toggle.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -618,6 +629,26 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
 }
 
+static VoidIMP origMaximizeWindow = NULL;
+static VoidIMP origMinimizeWindow = NULL;
+
+// Window-state toggles: updateVerticalConstraints is only called
+// from the maximized branch (and setup/bar toggle), so restoring
+// to windowed (or minimizing) never ran ApplyLayout — the pill
+// clamp in v15 therefore never fired on shrink, and the pill stayed
+// outside the smaller view. Run the layout pass after every
+// maximize/minimize toggle so the clamp (and safe-area fix) apply
+// on both directions.
+static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
+    if (origMaximizeWindow) origMaximizeWindow(self, _cmd);
+    MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
+}
+
+static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
+    if (origMinimizeWindow) origMinimizeWindow(self, _cmd);
+    MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
+}
+
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
@@ -785,6 +816,16 @@ static void MultitaskFloatConstructor(void) {
     if (mLayout) {
         origUpdateVerticalConstraints = (VoidIMP)method_getImplementation(mLayout);
         method_setImplementation(mLayout, (IMP)MultitaskFloatUpdateVerticalConstraints);
+    }
+    Method mMax = class_getInstanceMethod(cls, @selector(maximizeWindow));
+    if (mMax) {
+        origMaximizeWindow = (VoidIMP)method_getImplementation(mMax);
+        method_setImplementation(mMax, (IMP)MultitaskFloatMaximizeWindow);
+    }
+    Method mMin = class_getInstanceMethod(cls, @selector(minimizeWindow));
+    if (mMin) {
+        origMinimizeWindow = (VoidIMP)method_getImplementation(mMin);
+        method_setImplementation(mMin, (IMP)MultitaskFloatMinimizeWindow);
     }
     // Safe-area compensation inside the recompute path (see above):
     // swap the method's implementation for the C function; the
