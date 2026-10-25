@@ -101,6 +101,18 @@
 // now produces the compensated value, so it can no longer be wiped.
 // The async settings block is removed; the swizzle is the single
 // source of truth for the safe area.
+// v10 notes: the three buttons sit fixed at the top-right and block
+// the app's own controls behind them. v10 detaches them from the nav
+// bar into a floating pill on the decorated view itself: same symbols,
+// colors and point size as the originals, left to right minimize /
+// maximize / close, calling the same window methods. The pill drags
+// anywhere (pan on the pill; taps still work because the pan only
+// takes over once the finger moves) and docks to the nearest
+// left/right edge on release, AssistiveTouch-style; it is clamped to
+// the window when maximized and to the decorated view when windowed
+// (windowed mode still clips subviews). The bar's own items are
+// cleared on both sides. The pill's maximize icon is synced from the
+// window state on every layout and after maximize/restore.
 
 // Minimal interface: only what this tweak touches. The real headers pull in
 // private headers or are Swift-generated, so they cannot be imported here.
@@ -120,6 +132,8 @@
 @property(nonatomic) NSArray *activatedVerticalConstraints;
 @property(nonatomic) BOOL isMaximized;
 - (void)maximizeWindow;
+- (void)minimizeWindow;
+- (void)closeWindow;
 - (void)moveWindow:(UIPanGestureRecognizer *)sender;
 - (void)updateOriginalFrame;
 @end
@@ -137,6 +151,12 @@ static VoidIMP origUpdateVerticalConstraints = NULL;
 static ViewDidAppearIMP origViewDidAppear = NULL;
 static GestureShouldBeginIMP origGestureShouldBegin = NULL;
 static BOOL dockSwizzled = NO;
+
+// Floating pill (v10): the three buttons detached from the nav bar so
+// the user can drag them anywhere like AssistiveTouch instead of
+// having them block the app's own controls. Stored on the VC.
+static const char kMultitaskFloatPillKey;
+static const char kMultitaskFloatPillPlacedKey;
 
 // Forward declaration: defined after InitImpl, used by it.
 static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
@@ -249,8 +269,116 @@ static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSStri
         MultitaskFloatHideDockFully();
         // Drag handle for the buttons when maximized (once per window).
         MultitaskFloatAddDragGesture(dvc);
+        // Floating pill replacing the bar's buttons (once per window).
+        MultitaskFloatAddFloatingPill(dvc);
     }
     return vc;
+}
+
+// Floating pill (v10). The bar's own three buttons are replaced by a
+// pill that lives on the decorated view itself, so the user can drag
+// it anywhere (AssistiveTouch-style) instead of having it fixed at the
+// top-right blocking the app's own controls. Taps still work: the pan
+// only takes over once the finger moves, otherwise the button fires.
+static void MultitaskFloatSyncPill(DecoratedAppSceneViewController *vc) {
+    if (!vc) return;
+    UIView *pill = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
+    if (!pill) return;
+    for (UIView *v in pill.subviews) {
+        if ([v isKindOfClass:[UIButton class]] && v.tag == 1) {
+            NSString *name = vc.isMaximized ? @"arrow.down.right.and.arrow.up.left.circle" : @"arrow.up.left.and.arrow.down.right.circle";
+            UIImage *img = [UIImage systemImageNamed:name];
+            UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
+            [(UIButton *)v setImage:[img imageWithConfiguration:cfg] forState:UIControlStateNormal];
+            break;
+        }
+    }
+}
+
+static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sender) {
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    UIView *pill = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
+    if (!pill || !vc.view) return;
+    CGRect allowed;
+    if (vc.isMaximized && vc.view.window) {
+        allowed = [vc.view convertRect:vc.view.window.bounds fromView:vc.view.window];
+    } else {
+        allowed = vc.view.bounds;
+    }
+    CGFloat hw = pill.bounds.size.width / 2, hh = pill.bounds.size.height / 2;
+    if (sender.state == UIGestureRecognizerStateChanged) {
+        CGPoint t = [sender translationInView:vc.view];
+        [sender setTranslation:CGPointZero inView:vc.view];
+        CGPoint c = CGPointMake(pill.center.x + t.x, pill.center.y + t.y);
+        c.x = fmax(allowed.origin.x + hw, fmin(c.x, allowed.origin.x + allowed.size.width - hw));
+        c.y = fmax(allowed.origin.y + hh, fmin(c.y, allowed.origin.y + allowed.size.height - hh));
+        pill.center = c;
+    } else if (sender.state == UIGestureRecognizerStateEnded || sender.state == UIGestureRecognizerStateCancelled) {
+        // Dock to the nearest left/right edge on release, keep the height.
+        CGFloat midX = allowed.origin.x + allowed.size.width / 2;
+        CGFloat targetX = (pill.center.x < midX) ? (allowed.origin.x + hw + 8) : (allowed.origin.x + allowed.size.width - hw - 8);
+        [UIView animateWithDuration:0.25 animations:^{
+            pill.center = CGPointMake(targetX, pill.center.y);
+        }];
+    }
+}
+
+static void MultitaskFloatPillButton(id self, SEL _cmd, UIButton *sender) {
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    if (sender.tag == 0) {
+        [vc minimizeWindow];
+    } else if (sender.tag == 1) {
+        [vc maximizeWindow];
+        // The maximize icon flips in the completion (~0.3s); sync after it.
+        __weak DecoratedAppSceneViewController *weakVC = vc;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            MultitaskFloatSyncPill(weakVC);
+        });
+    } else if (sender.tag == 2) {
+        [vc closeWindow];
+    }
+}
+
+static void MultitaskFloatAddFloatingPill(DecoratedAppSceneViewController *vc) {
+    if (!vc.view) return;
+    if (objc_getAssociatedObject(vc, &kMultitaskFloatPillKey)) return;
+    // The pill replaces the bar's buttons (both sides: bottom-bar mode
+    // puts them on the left). Clearing both also neuters the left/right
+    // swap that runs when the bottom-bar setting changes.
+    vc.navigationItem.leftBarButtonItems = @[];
+    vc.navigationItem.rightBarButtonItems = @[];
+    CGFloat btn = 28, pad = 8, gap = 8;
+    CGFloat pillW = pad * 2 + btn * 3 + gap * 2;
+    CGFloat pillH = 40;
+    UIView *pill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pillW, pillH)];
+    pill.backgroundColor = [[UIColor systemBackgroundColor] colorWithAlphaComponent:0.75];
+    pill.layer.cornerRadius = pillH / 2;
+    pill.layer.masksToBounds = YES;
+    // Left to right, matching the screenshots: minimize (yellow),
+    // maximize (green), close (red). Same symbols, colors and point
+    // size as the bar's original buttons.
+    NSArray *names = @[@"minus.circle", @"arrow.up.left.and.arrow.down.right.circle", @"xmark.circle"];
+    NSArray *colors = @[[UIColor systemYellowColor], [UIColor systemGreenColor], [UIColor systemRedColor]];
+    UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
+    for (NSInteger i = 0; i < 3; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        b.frame = CGRectMake(pad + i * (btn + gap), (pillH - btn) / 2, btn, btn);
+        UIImage *img = [[UIImage systemImageNamed:names[i]] imageWithConfiguration:cfg];
+        [b setImage:img forState:UIControlStateNormal];
+        b.tintColor = colors[i];
+        b.tag = i;
+        [b addTarget:vc action:@selector(MultitaskFloatPillButton:) forControlEvents:UIControlEventTouchUpInside];
+        [pill addSubview:b];
+    }
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:vc action:@selector(MultitaskFloatPillPan:)];
+    pan.minimumNumberOfTouches = 1;
+    pan.maximumNumberOfTouches = 1;
+    [pill addGestureRecognizer:pan];
+    pill.alpha = 0; // placed (and shown) on first layout, once the window exists
+    [vc.view addSubview:pill];
+    [vc.view bringSubviewToFront:pill];
+    objc_setAssociatedObject(vc, &kMultitaskFloatPillKey, pill, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, &kMultitaskFloatPillPlacedKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // Shared layout pass: strip the bar, extend the scene, hide the dock.
@@ -312,6 +440,27 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
     }
     // Keep the dock fully gone even if its view appears late.
     MultitaskFloatHideDockFully();
+    // Place the floating pill once, when the window exists: top-right,
+    // just below the status bar when maximized, at the decorated view's
+    // top-right when windowed. After that the user owns the position.
+    UIView *pill = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
+    NSNumber *placed = objc_getAssociatedObject(vc, &kMultitaskFloatPillPlacedKey);
+    if (pill && (!placed || !placed.boolValue) && vc.view.window) {
+        CGRect ref;
+        CGFloat topInset = 0;
+        if (vc.isMaximized) {
+            ref = [vc.view convertRect:vc.view.window.bounds fromView:vc.view.window];
+            topInset = vc.view.window.safeAreaInsets.top;
+        } else {
+            ref = vc.view.bounds;
+        }
+        CGFloat hw = pill.bounds.size.width / 2, hh = pill.bounds.size.height / 2;
+        pill.center = CGPointMake(ref.origin.x + ref.size.width - hw - 12, ref.origin.y + topInset + hh + 8);
+        pill.alpha = 1.0;
+        objc_setAssociatedObject(vc, &kMultitaskFloatPillPlacedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Keep the pill's maximize icon in step with the window state.
+    MultitaskFloatSyncPill(vc);
 }
 
 static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
@@ -335,6 +484,8 @@ static void MultitaskFloatDragWindow(id self, SEL _cmd, UIPanGestureRecognizer *
         [UIView performWithoutAnimation:^{
             [vc maximizeWindow];
         }];
+        // Restore completed synchronously, so the icon flips now.
+        MultitaskFloatSyncPill(vc);
     }
     [vc moveWindow:sender];
 }
@@ -454,4 +605,7 @@ static void MultitaskFloatConstructor(void) {
     }
     // The drag handler itself is a new selector, so adding it is safe.
     class_addMethod(cls, @selector(MultitaskFloatDragWindow:), (IMP)MultitaskFloatDragWindow, "v@:@");
+    // Floating pill handlers are new selectors too, so adding them is safe.
+    class_addMethod(cls, @selector(MultitaskFloatPillPan:), (IMP)MultitaskFloatPillPan, "v@:@");
+    class_addMethod(cls, @selector(MultitaskFloatPillButton:), (IMP)MultitaskFloatPillButton, "v@:@");
 }
