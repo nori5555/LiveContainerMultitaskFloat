@@ -706,6 +706,10 @@ static CGFloat MultitaskFloatDeviceCornerRadius(void) {
 // bar; maximized only clears clipping so the scene can paint past
 // the top edge. The capsule is deliberately conspicuous (48x6,
 // 0.65 alpha) so it cannot be missed.
+// v45: drag bar moved to just outside the window top (superview,
+// capsule 3–9pt above the edge) for reliable grabbing; scene view
+// gets its own corner clip so small windows stay rounded even if
+// the host resets the decorated view's masks.
 // v40: pin support. The capsule color shows the pin state (gray =
 // normal, blue = pinned), synced on every layout pass so it
 // survives restores and appearance changes, not just the tap.
@@ -726,6 +730,14 @@ static void MultitaskFloatBringPinnedToFront(void) {
     for (DecoratedAppSceneViewController *pinnedVC in MultitaskFloatPinnedWindows) {
         if (pinnedVC.view && pinnedVC.view.superview) {
             [pinnedVC.view.superview bringSubviewToFront:pinnedVC.view];
+            // v45: bringing the window forward puts it above its
+            // superview drag bar; put the bar back immediately above
+            // its window so the full hit area (not just the part
+            // protruding past the top edge) stays grabbable.
+            UIView *dragBar = objc_getAssociatedObject(pinnedVC, &kMultitaskFloatDragBarKey);
+            if (dragBar && dragBar.superview == pinnedVC.view.superview && !pinnedVC.isMaximized) {
+                [pinnedVC.view.superview insertSubview:dragBar aboveSubview:pinnedVC.view];
+            }
         }
     }
 }
@@ -745,6 +757,22 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         } else {
             vc.view.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
             vc.view.layer.masksToBounds = YES;
+        }
+        // v45: also clip the scene view itself (defense-in-depth for
+        // rounded corners). Some apps end up square in small-window
+        // mode because the host resets the decorated view's masks
+        // after our sync; the host never touches the scene view, so
+        // its own rounding still clips the app content to the window
+        // shape. Maximized clears both (full-screen, square).
+        UIView *sceneView = vc.appSceneVC.view;
+        if (sceneView) {
+            if (vc.isMaximized) {
+                sceneView.layer.cornerRadius = 0;
+                sceneView.layer.masksToBounds = NO;
+            } else {
+                sceneView.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
+                sceneView.layer.masksToBounds = YES;
+            }
         }
     }
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
@@ -780,15 +808,50 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         pinTap.numberOfTapsRequired = 2;
         pinTap.numberOfTouchesRequired = 1;
         [container addGestureRecognizer:pinTap];
-        [vc.view addSubview:container];
+        // v45: the drag bar lives in the window's superview, not in
+        // the window itself (see positioning below) — it must be
+        // able to sit above the window's top edge, which the
+        // window's own masksToBounds would clip.
+        UIView *parent = vc.view.superview ? vc.view.superview : vc.view;
+        [parent addSubview:container];
         objc_setAssociatedObject(vc, &kMultitaskFloatDragBarKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         dragBar = container;
     }
-    dragBar.hidden = vc.isMaximized;
+    // v45: hide the bar during the open pop as well — it no longer
+    // scales with the window (it lives in the superview), so showing
+    // it mid-pop would leave it floating at the final position while
+    // the window is still small; the pop completion re-syncs and it
+    // appears in place.
+    dragBar.hidden = vc.isMaximized || animatingOpen;
     if (!vc.isMaximized) {
-        CGRect b = vc.view.bounds;
-        dragBar.center = CGPointMake(b.origin.x + b.size.width / 2, b.origin.y + 22);
-        [vc.view bringSubviewToFront:dragBar];
+        // v45: drag bar sits just outside the window's top edge
+        // (capsule 3–9pt above it) so it is always grabbable and the
+        // app's own top controls can never intercept the drag — the
+        // old inside position sometimes failed to drag when the app's
+        // header covered it. It lives in the superview (the window's
+        // own masksToBounds would clip a protruding subview), placed
+        // immediately above the window so higher windows still win
+        // touches over it, and clamped so it never leaves the top of
+        // the screen when the window itself is near the top. The
+        // container straddles the edge (28pt above, 16pt inside), so
+        // the handle reads as attached, not floating away. It sits
+        // above the whole window subtree, so on the rare overlap with
+        // the floating pill the handle wins — acceptable, the pill is
+        // almost never parked exactly at top-center.
+        UIView *parent = vc.view.superview;
+        if (parent) {
+            if (dragBar.superview != parent) [parent addSubview:dragBar];
+            CGFloat windowTop = vc.view.frame.origin.y;
+            CGFloat windowMidX = vc.view.frame.origin.x + vc.view.frame.size.width / 2;
+            CGFloat centerY = windowTop - 6;
+            if (centerY < 22) centerY = 22;
+            dragBar.center = CGPointMake(windowMidX, centerY);
+            [parent insertSubview:dragBar aboveSubview:vc.view];
+        } else {
+            CGRect b = vc.view.bounds;
+            dragBar.center = CGPointMake(b.origin.x + b.size.width / 2, b.origin.y + 22);
+            [vc.view bringSubviewToFront:dragBar];
+        }
         UIView *pillTop = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
         if (pillTop) [vc.view bringSubviewToFront:pillTop];
     }
@@ -1389,6 +1452,20 @@ static void MultitaskFloatDragWindow(id self, SEL _cmd, UIPanGestureRecognizer *
         MultitaskFloatSyncPill(vc);
     }
     [vc moveWindow:sender];
+    // v45: the drag bar is in the superview, so it no longer rides
+    // along with the window automatically — re-glue it to the new
+    // top edge on every pan update (layout does not run mid-drag).
+    if (!vc.isMaximized) {
+        UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
+        UIView *parent = vc.view.superview;
+        if (dragBar && parent && dragBar.superview == parent) {
+            CGFloat windowTop = vc.view.frame.origin.y;
+            CGFloat windowMidX = vc.view.frame.origin.x + vc.view.frame.size.width / 2;
+            CGFloat centerY = windowTop - 6;
+            if (centerY < 22) centerY = 22;
+            dragBar.center = CGPointMake(windowMidX, centerY);
+        }
+    }
     // v40: dragging any window can reorder windows, so re-assert
     // pinned windows on top after the move (idempotent).
     MultitaskFloatBringPinnedToFront();
