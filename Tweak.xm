@@ -589,14 +589,23 @@ static void MultitaskFloatAddFloatingPill(DecoratedAppSceneViewController *vc) {
     UIView *pill = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pillW, pillH)];
     pill.backgroundColor = [UIColor clearColor];
     pill.layer.cornerRadius = pillH / 2;
-    pill.layer.masksToBounds = YES;
-    pill.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.25].CGColor;
-    pill.layer.borderWidth = 0.5;
-    // Glass background: blur the app content behind the pill, so the
-    // pill reads as frosted glass instead of a solid chip. The effect
+    // masksToBounds NO so the shadow below is not clipped; the blur
+    // view itself still clips to the pill shape (see below), and the
+    // buttons sit inset by pad, so nothing overflows the rounded rect.
+    pill.layer.masksToBounds = NO;
+    pill.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.6].CGColor;
+    pill.layer.borderWidth = 1.0;
+    pill.layer.shadowColor = [[UIColor blackColor] CGColor];
+    pill.layer.shadowOpacity = 0.15;
+    pill.layer.shadowRadius = 8;
+    pill.layer.shadowOffset = CGSizeMake(0, 2);
+    // Glass background, v26: SystemMaterial was too opaque on white
+    // app backgrounds and read as a solid chip (the video's pill).
+    // UltraThinMaterial is genuinely see-through, so the app content
+    // behind blurs through and the pill reads as glass. The effect
     // view sits behind the buttons, follows the pill's bounds, and
     // never intercepts touches (buttons and the drag pan keep working).
-    UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+    UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial]];
     glass.frame = pill.bounds;
     glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     glass.layer.cornerRadius = pillH / 2;
@@ -896,7 +905,11 @@ static NSTimeInterval MultitaskFloatLastTapTime = 0;
 typedef void (*SendEventIMP)(id, SEL, UIEvent *);
 static SendEventIMP origSendEvent = NULL;
 static void MultitaskFloatSendEvent(id self, SEL _cmd, UIEvent *event) {
-    if (origSendEvent) origSendEvent(self, _cmd, event);
+    // Record BEFORE orig: a launch tap opens its guest synchronously
+    // inside origSendEvent (button action -> viewDidAppear), so
+    // recording after orig is too late — the first open always saw
+    // the previous tap (or none) and fell back to a center fade
+    // instead of growing from the tapped row (the v25 first-open bug).
     @try {
         if (event.type == UIEventTypeTouches) {
             for (UITouch *touch in event.allTouches) {
@@ -907,6 +920,7 @@ static void MultitaskFloatSendEvent(id self, SEL _cmd, UIEvent *event) {
             }
         }
     } @catch (NSException *e) {}
+    if (origSendEvent) origSendEvent(self, _cmd, event);
 }
 
 // Open animation, v25: grow from the tapped icon (like iOS opening
