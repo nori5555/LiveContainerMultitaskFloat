@@ -329,6 +329,7 @@ static BOOL dockSwizzled = NO;
 typedef void (*BannerDoubleTappedIMP)(id, SEL, UITapGestureRecognizer *);
 static VoidIMP origBannerViewDidLoad = NULL;
 static BannerDoubleTappedIMP origBannerDoubleTapped = NULL;
+static VoidIMP origBannerViewDidLayoutSubviews = NULL;
 
 // Floating pill (v10): the three buttons detached from the nav bar so
 // the user can drag them anywhere like AssistiveTouch instead of
@@ -1521,6 +1522,11 @@ static UIEdgeInsets MultitaskFloatMaximizedSafeArea(id self, SEL _cmd, UIMutable
 // the global multitask-launch default, tap the row's own Launch, and
 // restore the default. That also fixes the v42 JIT limitation — JIT
 // apps now get runApp's full JIT step via the dot, like via Launch.
+// v44: the dot's color now matches the Launch button's color (see
+// SyncDotColor): the Launch capsule is per-app (icon hue) when the
+// host's dynamic-colors setting is on, otherwise FontColor/systemBlue;
+// the dot copies that accent on every layout, and its icon stays
+// white like the Launch title.
 
 // v42: LCAppBannerViewController is a Swift class; its ObjC runtime
 // name is module-prefixed (e.g. "LiveContainer.LCAppBannerViewController").
@@ -1660,6 +1666,55 @@ static void MultitaskFloatBannerDoubleTapped(id self, SEL _cmd, UITapGestureReco
 // constructor): class lookup, method swaps, one new selector. If the
 // banner class is not found, do nothing — the window hooks are
 // unaffected.
+// v44: keep the dot's color identical to the Launch button's color.
+// The Launch button (LCAppBannerRunControl) does not paint via its
+// backgroundColor — its visible capsule is a CALayer sublayer
+// (baseLayer, added first in its setupView, frame == bounds) whose
+// backgroundColor is the row's accent color: the app icon's dominant
+// hue when the host's dynamic-colors setting is on, otherwise the
+// FontColor asset (falling back to systemBlue). That accent is set in
+// the Swift update() (after viewDidLoad, and again on every row reuse),
+// which ObjC cannot hook (not @objc). So instead of copying once,
+// sync on every layout of the banner VC: by first layout the row's
+// update has already set the Launch color, and on reuse update()
+// triggers layout again, so the dot always matches the Launch button
+// it sits next to — including per-app hues and light/dark changes.
+// The Launch title is white, so the dot's white icon already matches
+// and stays white. Uses only public APIs (layer.sublayers); if no
+// base layer color is found yet (update has not run), the dot keeps
+// its systemBlue fallback from viewDidLoad.
+static void MultitaskFloatSyncDotColor(UIViewController *vc) {
+    if (!vc) return;
+    UIView *bannerView = vc.view;
+    if (!bannerView) return;
+    UIButton *dot = objc_getAssociatedObject(vc, &kMultitaskFloatDotKey);
+    if (!dot) return;
+    UIControl *runControl = nil;
+    for (UIView *sub in bannerView.subviews) {
+        if ([sub isKindOfClass:[UIControl class]] && sub != dot) { runControl = (UIControl *)sub; break; }
+    }
+    if (!runControl) return;
+    CALayer *baseLayer = nil;
+    for (CALayer *layer in runControl.layer.sublayers) {
+        if (layer.backgroundColor && CGRectEqualToRect(layer.frame, runControl.bounds)) { baseLayer = layer; break; }
+    }
+    if (!baseLayer) {
+        for (CALayer *layer in runControl.layer.sublayers) {
+            if (layer.backgroundColor) { baseLayer = layer; break; }
+        }
+    }
+    if (!baseLayer || !baseLayer.backgroundColor) return;
+    if (!CGColorEqualToColor(dot.backgroundColor.CGColor, baseLayer.backgroundColor)) {
+        dot.backgroundColor = [UIColor colorWithCGColor:baseLayer.backgroundColor];
+    }
+}
+
+// v44: layout hook for the dot color sync (see above).
+static void MultitaskFloatBannerViewDidLayoutSubviews(id self, SEL _cmd) {
+    if (origBannerViewDidLayoutSubviews) origBannerViewDidLayoutSubviews(self, _cmd);
+    MultitaskFloatSyncDotColor((UIViewController *)self);
+}
+
 static void MultitaskFloatHookBanner(void) {
     Class cls = MultitaskFloatBannerClass();
     if (!cls) return;
@@ -1678,6 +1733,14 @@ static void MultitaskFloatHookBanner(void) {
         origBannerDoubleTapped = (BannerDoubleTappedIMP)method_getImplementation(mDouble);
         if (!class_addMethod(cls, @selector(bannerDoubleTapped:), (IMP)MultitaskFloatBannerDoubleTapped, method_getTypeEncoding(mDouble))) {
             method_setImplementation(mDouble, (IMP)MultitaskFloatBannerDoubleTapped);
+        }
+    }
+    // v44: sync the dot's color from the Launch button on every layout.
+    Method mLayout = class_getInstanceMethod(cls, @selector(viewDidLayoutSubviews));
+    if (mLayout) {
+        origBannerViewDidLayoutSubviews = (VoidIMP)method_getImplementation(mLayout);
+        if (!class_addMethod(cls, @selector(viewDidLayoutSubviews), (IMP)MultitaskFloatBannerViewDidLayoutSubviews, method_getTypeEncoding(mLayout))) {
+            method_setImplementation(mLayout, (IMP)MultitaskFloatBannerViewDidLayoutSubviews);
         }
     }
 }
