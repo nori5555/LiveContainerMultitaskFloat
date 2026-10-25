@@ -330,6 +330,7 @@ static BOOL dockSwizzled = NO;
 static const char kMultitaskFloatPillKey = 0;
 static const char kMultitaskFloatPillPlacedKey = 0;
 static const char kMultitaskFloatDragBarKey = 0;
+static const char kMultitaskFloatDidAnimateOpenKey = 0;
 
 // Forward declaration: defined after InitImpl, used by it.
 static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
@@ -870,9 +871,23 @@ static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
     });
 }
 
+static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
+    if (!vc.view) return;
+    if (objc_getAssociatedObject(vc, &kMultitaskFloatDidAnimateOpenKey)) return;
+    objc_setAssociatedObject(vc, &kMultitaskFloatDidAnimateOpenKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UIView *view = vc.view;
+    view.alpha = 0;
+    view.transform = CGAffineTransformMakeScale(0.94, 0.94);
+    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        view.alpha = 1;
+        view.transform = CGAffineTransformIdentity;
+    } completion:nil];
+}
+
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    MultitaskFloatAnimateOpen(vc);
     MultitaskFloatApplyLayout(vc);
     // Delayed full recompute: the user's diagnostics (v17) show that
     // only a dock interaction has ever fixed the top, and it works
