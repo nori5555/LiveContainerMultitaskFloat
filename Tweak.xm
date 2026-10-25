@@ -71,6 +71,21 @@
 // method's exact UIEdgeInsets signature — no category, no %hook, no
 // CydiaSubstrate, no host class symbol at link time.
 //
+// v12 notes (2026-10-25): v11 still slid the top controls up. Cause:
+// the first maximized recompute runs before the decorated view's
+// frame is final, so the swizzle computes off = 0 and no compensation
+// is applied — and nothing re-triggers a recompute after layout
+// settles, until a dock change forces one (that is why collapsing
+// the sidebar "fixed" it). Fix: viewDidAppear pushes the compensated
+// safe area directly on the next runloop tick, when the frame is
+// final; the swizzle keeps later recomputes at the same value, so
+// it cannot double-add. Sidebar: the dock is now collapsed
+// automatically (isCollapsed) and the collapsed-hidden state is
+// persisted (LCHideCollapsedDock in the app-group defaults, the same
+// store the dock view reads on launch), so the sidebar stays gone
+// across window opens and relaunches instead of needing a manual
+// shrink every time.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -219,6 +234,31 @@ static void MultitaskFloatHideDockManager(id manager) {
     } @catch (id e) {
         // Dock hiding is cosmetic; never let it take the app down.
     }
+    // Collapse the dock and persist the collapsed-hidden state, so the
+    // sidebar stays gone across window opens and relaunches, instead
+    // of the user having to shrink it by hand every time: isCollapsed
+    // moves it to the side, and LCHideCollapsedDock (app-group
+    // defaults, read by the dock view on launch) makes the collapsed
+    // dock render at 0.01 opacity instead of the 0.4 sliver. Each write
+    // is guarded so it only fires once; failures are ignored.
+    @try {
+        id collapsed = [manager valueForKey:@"isCollapsed"];
+        if (!collapsed || ![collapsed boolValue]) {
+            [manager setValue:@YES forKey:@"isCollapsed"];
+        }
+    } @catch (id e) {}
+    @try {
+        Class lcUtils = objc_getClass("LCSharedUtils");
+        if (lcUtils && [lcUtils respondsToSelector:@selector(appGroupID)]) {
+            NSString *gid = [lcUtils appGroupID];
+            if (gid) {
+                NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:gid];
+                if (![d boolForKey:@"LCHideCollapsedDock"]) {
+                    [d setBool:YES forKey:@"LCHideCollapsedDock"];
+                }
+            }
+        }
+    } @catch (id e) {}
 }
 
 static void MultitaskFloatHideDockFully(void) {
@@ -446,8 +486,8 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
             }];
         }
         // No settings update here: the guest's top safe area is grown
-        // inside updateMaximizedSafeAreaWithSettings: (see the category
-        // below), so every host recompute produces the compensated
+        // inside updateMaximizedSafeAreaWithSettings: (see the C-function
+        // IMP below), so every host recompute produces the compensated
         // value instead of wiping an after-the-fact update.
     }
     // Keep the dock fully gone even if its view appears late.
@@ -483,6 +523,46 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
+    MultitaskFloatFixTopSafeArea((DecoratedAppSceneViewController *)self);
+}
+
+// The initial maximized recompute runs before the decorated view's
+// frame is final (during setup/activation), so the swizzle below
+// computes off = 0 and the guest's top controls slide up — and
+// nothing re-triggers a recompute after layout settles, until
+// something like a dock change forces one (which is why collapsing
+// the sidebar "fixes" it). So once the window appears and the frame
+// is final, push the compensated safe area directly on the next
+// runloop tick. This cannot double-add: the swizzle keeps every
+// later recompute at the same value, because the original resets the
+// base first and the swizzle adds on top each time.
+static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc) {
+    if (!vc.isMaximized || !vc.view.window || !vc.appSceneVC) return;
+    AppSceneViewController *appVC = vc.appSceneVC;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!vc.isMaximized || !vc.view.window) return;
+        UIWindow *w = vc.view.window;
+        BOOL portrait = YES;
+        if (w.windowScene) portrait = UIInterfaceOrientationIsPortrait(w.windowScene.interfaceOrientation);
+        if (!portrait) return;
+        CGFloat off = [vc.view convertRect:vc.view.bounds toView:w].origin.y;
+        if (off <= 0) return;
+        CGFloat scale = 1.0;
+        @try {
+            NSNumber *n = [vc valueForKey:@"scaleRatio"];
+            double v = [n doubleValue];
+            if (v > 0) scale = (CGFloat)v;
+        } @catch (id e) {}
+        CGFloat add = off / scale;
+        [appVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+            UIEdgeInsets p = settings.peripheryInsets;
+            p.top = add;
+            settings.peripheryInsets = p;
+            UIEdgeInsets pa = settings.safeAreaInsetsPortrait;
+            pa.top = add;
+            settings.safeAreaInsetsPortrait = pa;
+        }];
+    });
 }
 
 // Drag handle for the three buttons when maximized. moveWindow:
