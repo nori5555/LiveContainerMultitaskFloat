@@ -1007,12 +1007,35 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     view.alpha = 0;
     view.transform = CGAffineTransformMakeScale(startScale, startScale);
     objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // v31: bottom-strip cover (the user's suggestion). During the pop
+    // the scaled view does not fill the window, so the LiveContainer
+    // list underneath peeks through at the edges — most visible at
+    // the bottom, where the list's colorful tab bar shows as a thin
+    // strip (the video's black-loading frames). A black cover below
+    // the decorated view hides the whole underneath during the pop.
+    // Maximized only: in windowed mode the list around the small
+    // window is supposed to be visible. At pop end the view fills
+    // the window, so the cover is already fully hidden behind it and
+    // removing it causes no visual change. No touches: the cover
+    // never intercepts (the pop is 0.4s and the buttons stay above).
+    UIView *popCover = nil;
+    if (vc.isMaximized && vc.view.superview) {
+        popCover = [[UIView alloc] initWithFrame:vc.view.superview.bounds];
+        popCover.backgroundColor = [UIColor blackColor];
+        popCover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        popCover.userInteractionEnabled = NO;
+        [vc.view.superview insertSubview:popCover belowSubview:vc.view];
+    }
     [UIView animateWithDuration:0.4 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:0 animations:^{
         view.alpha = 1;
         view.transform = CGAffineTransformIdentity;
         view.layer.cornerRadius = finalRadius;
     } completion:^(BOOL finished) {
         (void)finished;
+        // v31: drop the pop cover (no-op when there is none, e.g.
+        // windowed mode). Done first and unconditionally so a cover
+        // can never outlive the pop, even if the window is gone.
+        [popCover removeFromSuperview];
         objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // Restore the default anchor (invisible: transform is identity).
         CALayer *l = view.layer;
