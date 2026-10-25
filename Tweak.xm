@@ -86,6 +86,16 @@
 // across window opens and relaunches instead of needing a manual
 // shrink every time.
 //
+// v13 notes (2026-10-25): v12 failed to build, two compile errors.
+// (1) Messaging a Class variable with an undeclared class method
+// ([lcUtils appGroupID]) is a hard error: the compiler has no
+// interface declaring +appGroupID. Fixed by calling it through
+// objc_msgSend with a cast (the file's existing pattern for runtime
+// calls), keeping the respondsToSelector: guard. (2) ViewDidAppear
+// called FixTopSafeArea before its definition (same use-before-
+// definition class of error as v10's pill call); fixed with a forward
+// declaration, as with AddDragGesture and AddFloatingPill.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -250,7 +260,7 @@ static void MultitaskFloatHideDockManager(id manager) {
     @try {
         Class lcUtils = objc_getClass("LCSharedUtils");
         if (lcUtils && [lcUtils respondsToSelector:@selector(appGroupID)]) {
-            NSString *gid = [lcUtils appGroupID];
+            NSString *gid = ((NSString *(*)(id, SEL))objc_msgSend)(lcUtils, @selector(appGroupID));
             if (gid) {
                 NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:gid];
                 if (![d boolForKey:@"LCHideCollapsedDock"]) {
@@ -519,6 +529,9 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
     origUpdateVerticalConstraints(self, _cmd);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
 }
+
+// Forward declaration: defined after ViewDidAppear, used by it.
+static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc);
 
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
