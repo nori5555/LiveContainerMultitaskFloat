@@ -65,20 +65,61 @@
 // classes only exist in LiveContainer itself, so in guest apps this tweak
 // is a no-op.
 
+// v7 notes: v6 changed nothing on the user's device. Two causes, both
+// timing. (1) The top-extension hook ran before the view entered a
+// window (and before the dock existed), so the window offset computed
+// to 0 and the dock view was nil — both fixes silently no-opped. v7
+// re-applies everything in viewDidAppear, when the window and the dock
+// are guaranteed to exist. (2) The user correctly pointed out that just
+// shifting the scene up would slide the app's top content up with it:
+// the guest's top safe area is 0 in maximized mode (the host already
+// insets the scene below the status bar), so moving the scene moves
+// the content. v7 therefore grows the guest's top safe area by the
+// same amount (via updateSettingsWithBlock), so content stays put and
+// only background/map fills the status-bar strip. (3) New: dragging
+// the three buttons when maximized. moveWindow: early-returns when
+// maximized, so the buttons could never be a drag handle. v7 adds a
+// pan gesture on the nav bar whose delegate only lets it begin when
+// maximized (the original move gesture is required to fail then, so
+// there is no double move); on drag start it restores the window
+// (maximizeWindow, without animation) and then moves it like
+// moveWindow: does. When not maximized the delegate refuses, so the
+// original gesture moves the window exactly as before.
+
 // Minimal interface: only what this tweak touches. The real headers pull in
 // private headers or are Swift-generated, so they cannot be imported here.
+@interface UIMutableApplicationSceneSettings : NSObject
+@property(nonatomic) UIEdgeInsets peripheryInsets;
+@property(nonatomic) UIEdgeInsets safeAreaInsetsPortrait;
+@end
+
+@interface AppSceneViewController : UIViewController
+- (void)updateSettingsWithBlock:(void (^)(UIMutableApplicationSceneSettings *settings))block;
+@end
+
 @interface DecoratedAppSceneViewController : UIViewController
 @property(nonatomic) UINavigationBar *navigationBar;
 @property(nonatomic) UINavigationItem *navigationItem;
-@property(nonatomic) UIViewController *appSceneVC;
+@property(nonatomic) AppSceneViewController *appSceneVC;
 @property(nonatomic) NSArray *activatedVerticalConstraints;
+@property(nonatomic) BOOL isMaximized;
+- (void)maximizeWindow;
+- (void)moveWindow:(UIPanGestureRecognizer *)sender;
+- (void)updateOriginalFrame;
 @end
 
 typedef id (*DecoratedInitIMP)(id, SEL, NSString *, NSString *, NSString *, UIViewController *);
 typedef void (*VoidIMP)(id, SEL);
+typedef void (*ViewDidAppearIMP)(id, SEL, BOOL);
+typedef BOOL (*GestureShouldBeginIMP)(id, SEL, UIGestureRecognizer *);
 static DecoratedInitIMP origDecoratedInit = NULL;
 static VoidIMP origUpdateVerticalConstraints = NULL;
+static ViewDidAppearIMP origViewDidAppear = NULL;
+static GestureShouldBeginIMP origGestureShouldBegin = NULL;
 static BOOL dockSwizzled = NO;
+
+// Forward declaration: defined after InitImpl, used by it.
+static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
 
 // MultitaskDockManager is a Swift class; its ObjC runtime name is either
 // the bare name or module-prefixed (e.g. "LiveContainerSwiftUI.
@@ -186,49 +227,140 @@ static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSStri
         // dock off-screen through the supported path.
         MultitaskFloatSwizzleDock();
         MultitaskFloatHideDockFully();
+        // Drag handle for the buttons when maximized (once per window).
+        MultitaskFloatAddDragGesture(dvc);
     }
     return vc;
 }
 
-static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
-    origUpdateVerticalConstraints(self, _cmd);
-    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
-    // Re-apply the strip in case the title was ever re-set.
+// Shared layout pass: strip the bar, extend the scene, hide the dock.
+// Called from updateVerticalConstraints (covers maximize/restore and bar
+// toggles) and from viewDidAppear (covers first appearance, when the
+// window and the dock are guaranteed to exist — the v6 lesson).
+static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
     MultitaskFloatStripBar(vc);
     UIView *sceneView = vc.appSceneVC.view;
-    if (!sceneView || !vc.view) return;
-    // Only change the CONSTANTs of the scene's top/bottom constraints
-    // that the original just installed. The constraints themselves, and
-    // the bar's own height constraint, are left untouched, so the layout
-    // structure never changes. Top: the decorated view starts below the
-    // status bar (safe-area inset), which leaves a white strip at the
-    // top; shift the scene up by exactly the decorated view's top offset
-    // within its window so the app itself paints under the status bar.
-    // Bottom stays at the decorated view's bottom edge. The bar keeps
-    // overlaying the scene, so the three buttons stay floating over the
-    // app exactly where they are.
-    CGFloat topOffset = 0;
-    if (vc.view.window) {
-        topOffset = [vc.view convertRect:vc.view.bounds toView:vc.view.window].origin.y;
-    }
-    BOOL changed = NO;
-    for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
-        if (c.firstItem == sceneView &&
-            (c.firstAttribute == NSLayoutAttributeTop || c.firstAttribute == NSLayoutAttributeBottom)) {
-            CGFloat target = (c.firstAttribute == NSLayoutAttributeTop) ? -topOffset : 0;
-            if (c.constant != target) {
-                c.constant = target;
-                changed = YES;
+    if (sceneView && vc.view) {
+        BOOL maximized = vc.isMaximized;
+        CGFloat topOffset = 0;
+        BOOL portrait = YES;
+        if (maximized && vc.view.window) {
+            topOffset = [vc.view convertRect:vc.view.bounds toView:vc.view.window].origin.y;
+            UIWindowScene *ws = vc.view.window.windowScene;
+            if (ws) portrait = UIInterfaceOrientationIsPortrait(ws.interfaceOrientation);
+        }
+        BOOL changed = NO;
+        for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
+            if (c.firstItem == sceneView &&
+                (c.firstAttribute == NSLayoutAttributeTop || c.firstAttribute == NSLayoutAttributeBottom)) {
+                CGFloat target;
+                if (c.firstAttribute == NSLayoutAttributeTop) {
+                    // Maximized + portrait: shift the scene up by the
+                    // decorated view's window offset so the app paints
+                    // under the status bar. Otherwise keep v5 behavior
+                    // (scene under the bar, no gap).
+                    target = (maximized && portrait) ? -topOffset : 0;
+                } else {
+                    target = 0;
+                }
+                if (c.constant != target) {
+                    c.constant = target;
+                    changed = YES;
+                }
             }
         }
-    }
-    if (changed) {
-        [UIView animateWithDuration:0.3 animations:^{
-            [vc.view layoutIfNeeded];
-        }];
+        if (changed) {
+            [UIView animateWithDuration:0.3 animations:^{
+                [vc.view layoutIfNeeded];
+            }];
+        }
+        if (maximized && portrait && topOffset > 0) {
+            // The scene grew up by topOffset; grow the guest's top safe
+            // area by the same amount (in guest points) so the app's
+            // top content stays exactly where it was and only
+            // background/map fills the status-bar strip. In maximized
+            // top-bar mode the guest's top base is 0, so setting the
+            // absolute value is idempotent. Async so it lands after
+            // any in-flight settings update (e.g. from maximizeWindow)
+            // instead of being overwritten by it.
+            __weak DecoratedAppSceneViewController *weakVC = vc;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                DecoratedAppSceneViewController *strongVC = weakVC;
+                if (!strongVC || !strongVC.view.window) return;
+                if (!strongVC.isMaximized || strongVC.navigationBar.hidden) return;
+                UIWindow *w = strongVC.view.window;
+                if (w.windowScene && !UIInterfaceOrientationIsPortrait(w.windowScene.interfaceOrientation)) return;
+                CGFloat off = [strongVC.view convertRect:strongVC.view.bounds toView:w].origin.y;
+                if (off <= 0) return;
+                CGFloat scale = 1.0;
+                @try {
+                    NSNumber *n = [strongVC valueForKey:@"scaleRatio"];
+                    double v = [n doubleValue];
+                    if (v > 0) scale = (CGFloat)v;
+                } @catch (id e) {}
+                CGFloat top = off / scale;
+                [strongVC.appSceneVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *s) {
+                    UIEdgeInsets p = s.peripheryInsets;
+                    p.top = top;
+                    s.peripheryInsets = p;
+                    UIEdgeInsets pa = s.safeAreaInsetsPortrait;
+                    pa.top = top;
+                    s.safeAreaInsetsPortrait = pa;
+                }];
+            });
+        }
     }
     // Keep the dock fully gone even if its view appears late.
     MultitaskFloatHideDockFully();
+}
+
+static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
+    origUpdateVerticalConstraints(self, _cmd);
+    MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
+}
+
+static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
+    MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
+}
+
+// Drag handle for the three buttons when maximized. moveWindow:
+// early-returns when maximized, so the buttons could never drag the
+// window. This gesture only begins when maximized (see the delegate
+// below); on drag start it restores the window without animation and
+// then moves it exactly like moveWindow: does.
+static void MultitaskFloatDragWindow(id self, SEL _cmd, UIPanGestureRecognizer *sender) {
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    if (sender.state == UIGestureRecognizerStateBegan && vc.isMaximized) {
+        [UIView performWithoutAnimation:^{
+            [vc maximizeWindow];
+        }];
+    }
+    [vc moveWindow:sender];
+}
+
+// Only take over button drags when maximized; otherwise let the
+// original bar gesture move the window (and require it to fail when
+// this one begins, so a maximized drag never moves twice).
+static BOOL MultitaskFloatDragShouldBegin(id self, SEL _cmd, UIGestureRecognizer *gr) {
+    BOOL origOK = origGestureShouldBegin ? origGestureShouldBegin(self, _cmd, gr) : YES;
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    return origOK && vc.isMaximized;
+}
+
+static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc) {
+    UINavigationBar *bar = vc.navigationBar;
+    if (!bar) return;
+    UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc] initWithTarget:vc action:@selector(MultitaskFloatDragWindow:)];
+    drag.minimumNumberOfTouches = 1;
+    drag.maximumNumberOfTouches = 1;
+    drag.delegate = (id<UIGestureRecognizerDelegate>)vc;
+    for (UIGestureRecognizer *g in bar.gestureRecognizers) {
+        if ([g isKindOfClass:[UIPanGestureRecognizer class]]) {
+            [g requireGestureRecognizerToFail:drag];
+        }
+    }
+    [bar addGestureRecognizer:drag];
 }
 
 __attribute__((constructor))
@@ -248,4 +380,24 @@ static void MultitaskFloatConstructor(void) {
         origUpdateVerticalConstraints = (VoidIMP)method_getImplementation(mLayout);
         method_setImplementation(mLayout, (IMP)MultitaskFloatUpdateVerticalConstraints);
     }
+    // viewDidAppear: the class does not define it, so adding an override
+    // is safe; chain to UIViewController's implementation.
+    Method mAppear = class_getInstanceMethod(cls, @selector(viewDidAppear:));
+    if (mAppear) {
+        origViewDidAppear = (ViewDidAppearIMP)method_getImplementation(mAppear);
+        if (!class_addMethod(cls, @selector(viewDidAppear:), (IMP)MultitaskFloatViewDidAppear, method_getTypeEncoding(mAppear))) {
+            method_setImplementation(mAppear, (IMP)MultitaskFloatViewDidAppear);
+        }
+    }
+    // Drag-gesture delegate: the class does not define it, so adding it
+    // is safe; if it ever appears, chain to the original.
+    if (!class_addMethod(cls, @selector(gestureRecognizerShouldBegin:), (IMP)MultitaskFloatDragShouldBegin, "c@:@")) {
+        Method mDel = class_getInstanceMethod(cls, @selector(gestureRecognizerShouldBegin:));
+        if (mDel) {
+            origGestureShouldBegin = (GestureShouldBeginIMP)method_getImplementation(mDel);
+            method_setImplementation(mDel, (IMP)MultitaskFloatDragShouldBegin);
+        }
+    }
+    // The drag handler itself is a new selector, so adding it is safe.
+    class_addMethod(cls, @selector(MultitaskFloatDragWindow:), (IMP)MultitaskFloatDragWindow, "v@:@");
 }
