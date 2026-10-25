@@ -141,6 +141,23 @@
 // layout pass after the original, so the clamp (and safe-area fix)
 // apply on both directions of every window-state toggle.
 //
+// v17 notes (2026-10-25): user on v16 reports the top is still
+// pushed under the status bar, and the shrunken small window has
+// no drag place. Two causes, both in ApplyLayout: (1) The scene
+// extension used the window safe area unconditionally, but when
+// the bar is hidden (collapsed + maximized, the v14+ state) or at
+// the bottom, the decorated view already starts at window y = 0,
+// so extending by 59pt pushed the scene too far up and put the
+// content under the status bar despite a correct safe area. The
+// extension is now 0 when the bar is hidden or at the bottom, and
+// the window safe area only when the top bar is visible. (2) The
+// loop forced the scene top to 0 in windowed mode, moving the
+// scene over the 44pt bar and covering the only drag handle, so
+// the small window could not be dragged. The loop now only touches
+// the top constraint in maximized + portrait and never touches
+// the bottom constraint, leaving the host's windowed layout (scene
+// below the bar) intact so the top strip stays draggable.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -528,16 +545,29 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
         BOOL maximized = vc.isMaximized;
         CGFloat topOffset = 0;
         BOOL portrait = YES;
+        // Bottom-bar mode: the scene's bottom constraint is inset by
+        // the bar height, which means the decorated view already fills
+        // the window from y = 0 (maxFrame is full), just like when
+        // the top bar is hidden. Detect it from the constraints so
+        // no new host API is needed.
+        BOOL bottomBar = NO;
+        for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
+            if (c.firstItem == sceneView && c.firstAttribute == NSLayoutAttributeBottom && c.constant < 0) bottomBar = YES;
+        }
         if (maximized && vc.view.window) {
             UIWindowScene *ws = vc.view.window.windowScene;
             if (ws) portrait = UIInterfaceOrientationIsPortrait(ws.interfaceOrientation);
-            // Timing-independent (see the swizzle): the final origin.y
-            // equals the window's top safe-area inset. Take the max
-            // of that and the current frame origin so a 0 from either
-            // source at first recompute cannot zero the extension.
+            // The extension must equal the decorated view's final
+            // origin.y in the window. That origin is the window's top
+            // safe-area inset ONLY when the top bar is visible: when
+            // the bar is hidden (collapsed + maximized) or the bar is
+            // at the bottom, maxFrame is the full window, so the view
+            // already starts at y = 0 and the extension must be 0 —
+            // extending by the safe area there pushed the scene 59pt
+            // too far up and put the content under the status bar
+            // even with a correct safe area (the v16 top bug).
             if (portrait) {
-                CGFloat frameOff = [vc.view convertRect:vc.view.bounds toView:vc.view.window].origin.y;
-                topOffset = fmax(vc.view.window.safeAreaInsets.top, frameOff);
+                topOffset = (vc.navigationBar.hidden || bottomBar) ? 0 : vc.view.window.safeAreaInsets.top;
             }
         }
         if (maximized) {
@@ -553,21 +583,22 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
         }
         BOOL changed = NO;
         for (NSLayoutConstraint *c in vc.activatedVerticalConstraints) {
-            if (c.firstItem == sceneView &&
-                (c.firstAttribute == NSLayoutAttributeTop || c.firstAttribute == NSLayoutAttributeBottom)) {
-                CGFloat target;
-                if (c.firstAttribute == NSLayoutAttributeTop) {
-                    // Maximized + portrait: shift the scene up by the
-                    // decorated view's window offset so the app paints
-                    // under the status bar. Otherwise keep v5 behavior
-                    // (scene under the bar, no gap).
-                    target = (maximized && portrait) ? -topOffset : 0;
-                } else {
-                    target = 0;
-                }
-                if (c.constant != target) {
-                    c.constant = target;
-                    changed = YES;
+            if (c.firstItem == sceneView && c.firstAttribute == NSLayoutAttributeTop) {
+                // Only in maximized + portrait do we shift the scene
+                // up so the app paints under the status bar. In every
+                // other case the host's value is left alone: forcing
+                // it to 0 in windowed mode moved the scene over the
+                // 44pt bar, covering the only drag handle, so the
+                // small window could not be dragged (the v16 windowed
+                // bug). The bottom constraint is never touched: the
+                // host value is correct in both top-bar (0) and
+                // bottom-bar (-barHeight) modes.
+                if (maximized && portrait) {
+                    CGFloat target = -topOffset;
+                    if (c.constant != target) {
+                        c.constant = target;
+                        changed = YES;
+                    }
                 }
             }
         }
