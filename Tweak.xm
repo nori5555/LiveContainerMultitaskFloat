@@ -325,6 +325,11 @@ static VoidIMP origViewDidLayoutSubviews = NULL;
 static GestureShouldBeginIMP origGestureShouldBegin = NULL;
 static BOOL dockSwizzled = NO;
 
+// v42: App list banner hooks (see below, before the constructor).
+typedef void (*BannerDoubleTappedIMP)(id, SEL, UITapGestureRecognizer *);
+static VoidIMP origBannerViewDidLoad = NULL;
+static BannerDoubleTappedIMP origBannerDoubleTapped = NULL;
+
 // Floating pill (v10): the three buttons detached from the nav bar so
 // the user can drag them anywhere like AssistiveTouch instead of
 // having them block the app's own controls. Stored on the VC.
@@ -333,6 +338,8 @@ static const char kMultitaskFloatPillPlacedKey = 0;
 static const char kMultitaskFloatDragBarKey = 0;
 static const char kMultitaskFloatAnimatingOpenKey = 0;
 static const char kMultitaskFloatPinnedKey = 0;
+static const char kMultitaskFloatDotKey = 0;
+static const char kMultitaskFloatDotTapTimeKey = 0;
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -1496,10 +1503,206 @@ static UIEdgeInsets MultitaskFloatMaximizedSafeArea(id self, SEL _cmd, UIMutable
     return r;
 }
 
+// v42: per-app multitask dot on the App list.
+// Each app row is LCAppBannerViewController (UIKit; its view is
+// LCAppBannerRootView, bannerHeight 88, with a 70x32 Launch control
+// trailing -14, centerY). The host already has the multitask action
+// in its long-press menu (runApp with the opposite mode), but reaching
+// it costs a long-press plus a menu tap. The dot surfaces a multitask
+// launch as one tap, per app: each row's VC gets its own dot, so it
+// scrolls with its row and always launches its own row's app — the
+// display name is read fresh from the row's name label on every tap,
+// so a reused VC still launches the app it currently shows.
+//
+// Why the dot calls LCUtils directly: the Swift runApp(multitask:)
+// is async and not @objc, so ObjC cannot call it. LCUtils is ObjC,
+// and launchMultitaskGuestApp:completionHandler: is exactly what
+// runApp's non-JIT multitask path calls. Consequence, stated
+// honestly: apps that need JIT get launched WITHOUT the follow-up
+// JIT step runApp performs, so for those apps (row shows the purple
+// JIT badge) the dot may open the app without JIT — they should keep
+// using Launch or the long-press menu. Ordinary apps do not need JIT
+// and launch the same way.
+
+// v42: LCAppBannerViewController is a Swift class; its ObjC runtime
+// name is module-prefixed (e.g. "LiveContainer.LCAppBannerViewController").
+// Same lookup discipline as the dock class: exact name first, then
+// module-prefixed suffix — never a loose substring. Accept only a
+// UIViewController descendant.
+static Class MultitaskFloatBannerClass(void) {
+    Class cls = objc_getClass("LCAppBannerViewController");
+    if (!cls) {
+        int count = objc_getClassList(NULL, 0);
+        if (count <= 0) return Nil;
+        Class *list = (Class *)malloc(sizeof(Class) * (size_t)count);
+        if (!list) return Nil;
+        count = objc_getClassList(list, count);
+        const char *suffix = ".LCAppBannerViewController";
+        size_t slen = strlen(suffix);
+        for (int i = 0; i < count; i++) {
+            const char *name = class_getName(list[i]);
+            if (!name) continue;
+            size_t nlen = strlen(name);
+            if (nlen > slen && strcmp(name + nlen - slen, suffix) == 0) { cls = list[i]; break; }
+        }
+        free(list);
+    }
+    if (!cls) return Nil;
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        if (strcmp(class_getName(c), "UIViewController") == 0) return cls;
+    }
+    return Nil;
+}
+
+// v42: the row's app display name is the name label's text
+// (update() sets nameLabel.text = model.displayName, the same value
+// runApp passes to launchMultitaskGuestApp). Find it without touching
+// Swift properties: walk the banner view, skipping UIControl subtrees
+// (the Launch control's title label is also 16pt bold, so a plain
+// largest-font search would tie with "启动"). Among the remaining
+// plain labels, the name (16pt bold) beats version (12), remark (10)
+// and container (8). Returns nil if nothing is found.
+static NSString *MultitaskFloatBannerDisplayName(UIView *root) {
+    if (!root) return nil;
+    NSString *best = nil;
+    CGFloat bestSize = 0;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0) {
+        UIView *v = [stack lastObject];
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UIControl class]]) continue;
+        if ([v isKindOfClass:[UILabel class]]) {
+            UILabel *label = (UILabel *)v;
+            CGFloat size = label.font ? label.font.pointSize : 0;
+            if (label.text && label.text.length > 0 && size > bestSize) { bestSize = size; best = label.text; }
+        }
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+    return best;
+}
+
+// v42: the Launch control is the banner view's only original UIControl
+// direct subview. This search runs in viewDidLoad before the dot is
+// added, so the only UIControl present is the Launch control.
+static UIControl *MultitaskFloatBannerRunControl(UIView *bannerView) {
+    if (!bannerView) return nil;
+    for (UIView *sub in bannerView.subviews) {
+        if ([sub isKindOfClass:[UIControl class]]) return (UIControl *)sub;
+    }
+    return nil;
+}
+
+// v42: dot tap — launch this row's app in multitask mode.
+// Debounced (a double-tap would otherwise launch twice), and the
+// display name is read fresh from the row so a reused VC launches
+// the app it currently shows. Calls LCUtils (ObjC) directly, because
+// the Swift runApp(multitask:) is async and not @objc.
+static void MultitaskFloatDotTapped(id self, SEL _cmd, UIButton *sender) {
+    (void)_cmd;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSNumber *last = objc_getAssociatedObject(sender, &kMultitaskFloatDotTapTimeKey);
+    if (last && now - [last doubleValue] < 1.5) return;
+    objc_setAssociatedObject(sender, &kMultitaskFloatDotTapTimeKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UIViewController *vc = (UIViewController *)self;
+    NSString *displayName = MultitaskFloatBannerDisplayName(vc.view);
+    if (!displayName || displayName.length == 0) return;
+    Class lcUtils = objc_getClass("LCUtils");
+    if (!lcUtils) return;
+    SEL sel = @selector(launchMultitaskGuestApp:completionHandler:);
+    if (![lcUtils respondsToSelector:sel]) return;
+    @try {
+        ((void (*)(id, SEL, NSString *, void (^)(NSNumber *, NSError *)))objc_msgSend)(
+            lcUtils, sel, displayName, ^(NSNumber *pid, NSError *error) {
+                (void)pid; (void)error;
+            });
+    } @catch (id e) {}
+}
+
+// v42: add the per-app multitask dot after the host sets the row up.
+// 32x32 circle (same height as the 70x32 Launch pill, so it reads as
+// the same size), 8pt left of Launch, vertically centered, with the
+// multitask SF Symbol (same icon the long-press menu uses). Added
+// once per VC (guarded by the associated object); Auto Layout keeps
+// it glued to Launch across rotations and row resizes, and because
+// the dot lives inside the row's own view it scrolls with its row.
+static void MultitaskFloatBannerViewDidLoad(id self, SEL _cmd) {
+    if (origBannerViewDidLoad) origBannerViewDidLoad(self, _cmd);
+    UIViewController *vc = (UIViewController *)self;
+    UIView *bannerView = vc.view;
+    if (!bannerView) return;
+    if (objc_getAssociatedObject(vc, &kMultitaskFloatDotKey)) return;
+    UIControl *runControl = MultitaskFloatBannerRunControl(bannerView);
+    if (!runControl) return;
+    UIButton *dot = [UIButton buttonWithType:UIButtonTypeCustom];
+    dot.translatesAutoresizingMaskIntoConstraints = NO;
+    dot.backgroundColor = [UIColor systemBlueColor];
+    dot.layer.cornerRadius = 16;
+    dot.layer.masksToBounds = YES;
+    UIImageSymbolConfiguration *symConfig = [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightSemibold];
+    UIImage *icon = [UIImage systemImageNamed:@"macwindow.badge.plus" withConfiguration:symConfig];
+    [dot setImage:icon forState:UIControlStateNormal];
+    dot.tintColor = [UIColor whiteColor];
+    [dot addTarget:vc action:@selector(MultitaskFloatDotTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [bannerView addSubview:dot];
+    [NSLayoutConstraint activateConstraints:@[
+        [dot.widthAnchor constraintEqualToConstant:32],
+        [dot.heightAnchor constraintEqualToConstant:32],
+        [dot.centerYAnchor constraintEqualToAnchor:bannerView.centerYAnchor],
+        [dot.trailingAnchor constraintEqualToAnchor:runControl.leadingAnchor constant:-8],
+    ]];
+    objc_setAssociatedObject(vc, &kMultitaskFloatDotKey, dot, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// v42: keep double-tap-on-dot from opening Settings. The host's
+// double-tap handler only excludes the Launch control's bounds, so a
+// double-tap on the dot would otherwise open Settings (and the dot
+// itself would fire twice, which the tap debounce already guards).
+// If the tap lands on the dot, swallow it; otherwise chain to orig.
+static void MultitaskFloatBannerDoubleTapped(id self, SEL _cmd, UITapGestureRecognizer *gr) {
+    UIViewController *vc = (UIViewController *)self;
+    UIView *bannerView = vc.view;
+    UIButton *dot = objc_getAssociatedObject(vc, &kMultitaskFloatDotKey);
+    if (bannerView && dot) {
+        CGPoint loc = [gr locationInView:bannerView];
+        if (CGRectContainsPoint(dot.frame, loc)) return;
+    }
+    if (origBannerDoubleTapped) origBannerDoubleTapped(self, _cmd, gr);
+}
+
+// v42: hook the App list rows. Pure runtime only (safe for the
+// constructor): class lookup, method swaps, one new selector. If the
+// banner class is not found, do nothing — the window hooks are
+// unaffected.
+static void MultitaskFloatHookBanner(void) {
+    Class cls = MultitaskFloatBannerClass();
+    if (!cls) return;
+    Method mLoad = class_getInstanceMethod(cls, @selector(viewDidLoad));
+    if (mLoad) {
+        origBannerViewDidLoad = (VoidIMP)method_getImplementation(mLoad);
+        if (!class_addMethod(cls, @selector(viewDidLoad), (IMP)MultitaskFloatBannerViewDidLoad, method_getTypeEncoding(mLoad))) {
+            method_setImplementation(mLoad, (IMP)MultitaskFloatBannerViewDidLoad);
+        }
+    }
+    // The dot handler is a new selector, so adding it is safe.
+    class_addMethod(cls, @selector(MultitaskFloatDotTapped:), (IMP)MultitaskFloatDotTapped, "v@:@");
+    // Exclude dot taps from the host's double-tap-to-Settings.
+    Method mDouble = class_getInstanceMethod(cls, @selector(bannerDoubleTapped:));
+    if (mDouble) {
+        origBannerDoubleTapped = (BannerDoubleTappedIMP)method_getImplementation(mDouble);
+        if (!class_addMethod(cls, @selector(bannerDoubleTapped:), (IMP)MultitaskFloatBannerDoubleTapped, method_getTypeEncoding(mDouble))) {
+            method_setImplementation(mDouble, (IMP)MultitaskFloatBannerDoubleTapped);
+        }
+    }
+}
+
 __attribute__((constructor))
 static void MultitaskFloatConstructor(void) {
     // Dyld-init time: ONLY pure runtime calls. No UIKit, no defaults, no
     // Security. Everything else happens when windows are created/laid out.
+    // v42: banner hook is independent of the window class (it must run
+    // even if DecoratedAppSceneViewController is absent, unlike the
+    // window hooks below which return early without it).
+    MultitaskFloatHookBanner();
     MultitaskFloatSwizzleDock();
     Class cls = objc_getClass("DecoratedAppSceneViewController");
     if (!cls) return;
