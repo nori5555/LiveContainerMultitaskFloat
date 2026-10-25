@@ -330,6 +330,7 @@ static BOOL dockSwizzled = NO;
 static const char kMultitaskFloatPillKey = 0;
 static const char kMultitaskFloatPillPlacedKey = 0;
 static const char kMultitaskFloatDragBarKey = 0;
+static const char kMultitaskFloatAnimatingOpenKey = 0;
 
 // Forward declaration: defined after InitImpl, used by it.
 static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
@@ -611,21 +612,19 @@ static void MultitaskFloatAddFloatingPill(DecoratedAppSceneViewController *vc) {
     pill.layer.shadowOpacity = 0.15;
     pill.layer.shadowRadius = 8;
     pill.layer.shadowOffset = CGSizeMake(0, 2);
-    // Liquid glass (v28): the user wants liquid glass, not frosted
-    // blur — UltraThinMaterial still reads as a frosted chip. Use
-    // iOS 26 UIGlassEffect via runtime lookup (no compile-time
+    // Liquid glass (v29): v28 tried +[UIGlassEffect glassEffect],
+    // but that factory does not exist — the real API is
+    // [[UIGlassEffect alloc] init] (Swift: UIGlassEffect()), so v28
+    // silently fell back to ultra-thin blur and the pill stayed
+    // frosted. Use alloc/init via runtime lookup (no compile-time
     // dependency, so older SDKs still build), with an ultra-thin
-    // blur fallback on systems without it. The effect view sits
-    // behind the buttons, follows the pill's bounds, and never
+    // blur fallback only when the class is absent. The effect view
+    // sits behind the buttons, follows the pill's bounds, and never
     // intercepts touches (buttons and the drag pan keep working).
     UIVisualEffect *glassEffect = nil;
     Class liquidCls = NSClassFromString(@"UIGlassEffect");
     if (liquidCls) {
-        SEL glassSel = NSSelectorFromString(@"glassEffect");
-        if ([liquidCls respondsToSelector:glassSel]) {
-            id (*liquidMsgSend)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-            glassEffect = liquidMsgSend((id)liquidCls, glassSel);
-        }
+        glassEffect = [[liquidCls alloc] init];
     }
     if (!glassEffect) {
         glassEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
@@ -694,11 +693,20 @@ static CGFloat MultitaskFloatDeviceCornerRadius(void) {
 // 0.65 alpha) so it cannot be missed.
 static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) {
     if (!vc.view) return;
-    if (vc.isMaximized) {
-        vc.view.layer.masksToBounds = NO;
-    } else {
-        vc.view.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
-        vc.view.layer.masksToBounds = YES;
+    // During the open animation (v29) the window's corners are part
+    // of the pop (rounded while it scales in); layout passes during
+    // the animation must not reset masks/cornerRadius, or the pop
+    // would lose its rounded clip mid-flight (maximized clears
+    // clipping outright). The drag bar and pill border below still
+    // sync. The animation's completion re-syncs chrome itself.
+    BOOL animatingOpen = [objc_getAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey) boolValue];
+    if (!animatingOpen) {
+        if (vc.isMaximized) {
+            vc.view.layer.masksToBounds = NO;
+        } else {
+            vc.view.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
+            vc.view.layer.masksToBounds = YES;
+        }
     }
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
     if (!dragBar) {
@@ -982,15 +990,30 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     pos.y -= oldPoint.y; pos.y += newPoint.y;
     layer.position = pos;
     layer.anchorPoint = anchor;
+    // v29: rounded pop with a spring (the user asked for both back).
+    // The window morphs like an iOS app opening from its icon: it
+    // starts round on screen (model radius = device radius divided
+    // by the start scale, so the scaled-down view still reads as
+    // device-round) and settles to the mode's final radius — device
+    // radius when windowed, 0 when maximized (full-screen square).
+    // masksToBounds stays YES through the pop so the corners clip;
+    // SyncWindowChrome is guarded while this flag is set, and the
+    // completion re-syncs chrome (maximized: radius already 0, so
+    // clearing clipping at the end causes no snap).
+    CGFloat deviceRadius = MultitaskFloatDeviceCornerRadius();
+    CGFloat finalRadius = vc.isMaximized ? 0 : deviceRadius;
+    layer.cornerRadius = deviceRadius / startScale;
+    layer.masksToBounds = YES;
     view.alpha = 0;
     view.transform = CGAffineTransformMakeScale(startScale, startScale);
-    // v27: push-style timing (system nav push: 0.35s ease-in-out,
-    // no overshoot) instead of a spring — the spring's bounce is
-    // what made the zoom feel unlike the system animation.
-    [UIView animateWithDuration:0.35 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
+    objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [UIView animateWithDuration:0.4 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:0 animations:^{
         view.alpha = 1;
         view.transform = CGAffineTransformIdentity;
+        view.layer.cornerRadius = finalRadius;
     } completion:^(BOOL finished) {
+        (void)finished;
+        objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // Restore the default anchor (invisible: transform is identity).
         CALayer *l = view.layer;
         CGPoint curAnchor = l.anchorPoint;
@@ -1001,6 +1024,11 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         p.y -= curPoint.y; p.y += defPoint.y;
         l.position = p;
         l.anchorPoint = CGPointMake(0.5, 0.5);
+        // Settle final chrome (guarded syncs during the pop skipped
+        // the masks/radius part).
+        if (vc.view.window) {
+            MultitaskFloatSyncWindowChrome(vc);
+        }
     }];
 }
 
