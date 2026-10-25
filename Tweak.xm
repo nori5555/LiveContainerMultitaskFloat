@@ -158,6 +158,20 @@
 // the bottom constraint, leaving the host's windowed layout (scene
 // below the bar) intact so the top strip stays draggable.
 //
+// v18 notes (2026-10-25): user diagnostics on v17 are decisive:
+// v17 is installed the same way, EVERY app slides up (systemic,
+// not app-specific), and only bringing out the sidebar and tapping
+// it restores normal controls. That means only a dock interaction
+// — a full host recompute with fully settled layout — has ever
+// fixed the top; the settings-only fix does not replicate it.
+// Fixed by forcing that same full recompute automatically: 0.5s
+// after appearance (past the host's 0.3s layout animation),
+// viewDidAppear schedules one updateVerticalConstraints call (via
+// the swizzle, so orig + ApplyLayout run). It does not call
+// viewDidAppear, so it cannot loop, and it is idempotent. The top
+// may briefly start high and then drop to normal when the delayed
+// recompute lands; that is expected.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -235,6 +249,7 @@
 - (void)closeWindow;
 - (void)moveWindow:(UIPanGestureRecognizer *)sender;
 - (void)updateOriginalFrame;
+- (void)updateVerticalConstraints;
 @end
 
 
@@ -682,7 +697,23 @@ static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
 
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
-    MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    MultitaskFloatApplyLayout(vc);
+    // Delayed full recompute: the user's diagnostics (v17) show that
+    // only a dock interaction has ever fixed the top, and it works
+    // by forcing a host recompute with fully settled layout (final
+    // frame, final window safe area). The settings-only fix above
+    // does not replicate that. Mimic the dock interaction
+    // automatically once layout has settled (past the host's 0.3s
+    // layout animation). This calls updateVerticalConstraints, not
+    // viewDidAppear, so it cannot loop; it is idempotent.
+    __weak DecoratedAppSceneViewController *weakVC = vc;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window && strongVC.isMaximized) {
+            [strongVC updateVerticalConstraints];
+        }
+    });
 }
 
 // The initial maximized recompute runs before the decorated view's
