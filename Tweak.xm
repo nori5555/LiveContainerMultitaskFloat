@@ -332,6 +332,12 @@ static const char kMultitaskFloatPillKey = 0;
 static const char kMultitaskFloatPillPlacedKey = 0;
 static const char kMultitaskFloatDragBarKey = 0;
 static const char kMultitaskFloatAnimatingOpenKey = 0;
+static const char kMultitaskFloatPinnedKey = 0;
+
+// Pinned windows (v40): weak refs, so a closed window drops out on
+// its own — no dangling pointers, no retain cycles. Created lazily
+// on the first pin (never in the constructor).
+static NSHashTable *MultitaskFloatPinnedWindows = nil;
 
 // Forward declaration: defined after InitImpl, used by it.
 static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
@@ -692,6 +698,30 @@ static CGFloat MultitaskFloatDeviceCornerRadius(void) {
 // bar; maximized only clears clipping so the scene can paint past
 // the top edge. The capsule is deliberately conspicuous (48x6,
 // 0.65 alpha) so it cannot be missed.
+// v40: pin support. The capsule color shows the pin state (gray =
+// normal, blue = pinned), synced on every layout pass so it
+// survives restores and appearance changes, not just the tap.
+static void MultitaskFloatSyncPinCapsule(DecoratedAppSceneViewController *vc) {
+    UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
+    if (!dragBar || dragBar.subviews.count == 0) return;
+    UIView *capsule = dragBar.subviews[0];
+    BOOL pinned = [objc_getAssociatedObject(vc, &kMultitaskFloatPinnedKey) boolValue];
+    capsule.backgroundColor = pinned ? [[UIColor systemBlueColor] colorWithAlphaComponent:0.9] : [[UIColor systemGrayColor] colorWithAlphaComponent:0.65];
+}
+
+// v40: re-assert every pinned window above all other windows.
+// Idempotent and layout-safe: bringSubviewToFront triggers neither
+// layout nor appear, so calling it from layout/appear/drag paths
+// cannot loop.
+static void MultitaskFloatBringPinnedToFront(void) {
+    if (!MultitaskFloatPinnedWindows) return;
+    for (DecoratedAppSceneViewController *pinnedVC in MultitaskFloatPinnedWindows) {
+        if (pinnedVC.view && pinnedVC.view.superview) {
+            [pinnedVC.view.superview bringSubviewToFront:pinnedVC.view];
+        }
+    }
+}
+
 static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) {
     if (!vc.view) return;
     // During the open animation (v29) the window's corners are part
@@ -722,6 +752,18 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         pan.minimumNumberOfTouches = 1;
         pan.maximumNumberOfTouches = 1;
         [container addGestureRecognizer:pan];
+        // v40: double-tap the drag bar to pin/unpin (window mode
+        // only — the bar is hidden when maximized, so a hidden bar
+        // never receives the tap). Added once, at creation, so no
+        // duplicate recognizers on later layout passes. Pan and
+        // double-tap coexist without require-to-fail: a tap has no
+        // movement (pan never begins), a drag has movement (tap
+        // never fires), and require-to-fail would have delayed
+        // dragging.
+        UITapGestureRecognizer *pinTap = [[UITapGestureRecognizer alloc] initWithTarget:vc action:@selector(MultitaskFloatTogglePin:)];
+        pinTap.numberOfTapsRequired = 2;
+        pinTap.numberOfTouchesRequired = 1;
+        [container addGestureRecognizer:pinTap];
         [vc.view addSubview:container];
         objc_setAssociatedObject(vc, &kMultitaskFloatDragBarKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         dragBar = container;
@@ -739,6 +781,8 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     // waiting for a maximize/minimize.
     UIView *pillBorder = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
     if (pillBorder) MultitaskFloatApplyPillBorder(pillBorder, vc.view);
+    // v40: capsule color follows the pin state on every layout.
+    MultitaskFloatSyncPinCapsule(vc);
 }
 
 static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
@@ -884,6 +928,11 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
     // ApplyLayout runs on both paths, and the fix re-checks state on
     // its async tick, so it is idempotent).
     MultitaskFloatFixTopSafeArea(vc);
+    // v40: pinned windows stay on top: any layout pass (maximize,
+    // restore, resize) can reorder windows, so re-assert pinned
+    // windows above all others here. Idempotent, no layout loop
+    // (bringSubviewToFront triggers neither layout nor appear).
+    MultitaskFloatBringPinnedToFront();
 }
 
 static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
@@ -914,6 +963,9 @@ static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
         DecoratedAppSceneViewController *strongVC = weakVC;
         if (strongVC && strongVC.view.window) {
             MultitaskFloatSyncWindowChrome(strongVC);
+            // v40: re-assert pinned on top once the toggle animation
+            // has settled (the host can reorder windows mid-animation).
+            MultitaskFloatBringPinnedToFront();
         }
     });
 }
@@ -927,6 +979,9 @@ static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
         DecoratedAppSceneViewController *strongVC = weakVC;
         if (strongVC && strongVC.view.window) {
             MultitaskFloatSyncWindowChrome(strongVC);
+            // v40: re-assert pinned on top once the toggle animation
+            // has settled (the host can reorder windows mid-animation).
+            MultitaskFloatBringPinnedToFront();
         }
     });
 }
@@ -1235,6 +1290,9 @@ static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
         if (strongVC && strongVC.view.window) {
             MultitaskFloatSyncWindowChrome(strongVC);
         }
+        // v40: re-assert pinned on top once layout has settled
+        // after appear (a new window's appear can bury pinned).
+        MultitaskFloatBringPinnedToFront();
     });
 }
 
@@ -1315,6 +1373,34 @@ static void MultitaskFloatDragWindow(id self, SEL _cmd, UIPanGestureRecognizer *
         MultitaskFloatSyncPill(vc);
     }
     [vc moveWindow:sender];
+    // v40: dragging any window can reorder windows, so re-assert
+    // pinned windows on top after the move (idempotent).
+    MultitaskFloatBringPinnedToFront();
+}
+
+// v40: double-tap the drag bar to pin/unpin. Pinning registers the
+// window in the weak pinned set and brings it to front at once;
+// unpinning deregisters it and leaves the order as is. The pin
+// persists across maximize/restore (the flag lives on the VC, and
+// the drag bar — hence the tap target — reappears in window mode);
+// closing the window drops it from the weak set automatically.
+// Capsule color updates at once (and again on every layout via
+// SyncWindowChrome).
+static void MultitaskFloatTogglePin(id self, SEL _cmd, UITapGestureRecognizer *sender) {
+    (void)sender;
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    if (vc.isMaximized) return;
+    BOOL pinned = [objc_getAssociatedObject(vc, &kMultitaskFloatPinnedKey) boolValue];
+    pinned = !pinned;
+    objc_setAssociatedObject(vc, &kMultitaskFloatPinnedKey, @(pinned), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (pinned) {
+        if (!MultitaskFloatPinnedWindows) MultitaskFloatPinnedWindows = [NSHashTable weakObjectsHashTable];
+        [MultitaskFloatPinnedWindows addObject:vc];
+        MultitaskFloatBringPinnedToFront();
+    } else {
+        [MultitaskFloatPinnedWindows removeObject:vc];
+    }
+    MultitaskFloatSyncPinCapsule(vc);
 }
 
 // Only take over button drags when maximized; otherwise let the
@@ -1466,6 +1552,8 @@ static void MultitaskFloatConstructor(void) {
     }
     // The drag handler itself is a new selector, so adding it is safe.
     class_addMethod(cls, @selector(MultitaskFloatDragWindow:), (IMP)MultitaskFloatDragWindow, "v@:@");
+    // v40: pin toggle is a new selector too, so adding it is safe.
+    class_addMethod(cls, @selector(MultitaskFloatTogglePin:), (IMP)MultitaskFloatTogglePin, "v@:@");
     // Floating pill handlers are new selectors too, so adding them is safe.
     class_addMethod(cls, @selector(MultitaskFloatPillPan:), (IMP)MultitaskFloatPillPan, "v@:@");
     class_addMethod(cls, @selector(MultitaskFloatPillButton:), (IMP)MultitaskFloatPillButton, "v@:@");
