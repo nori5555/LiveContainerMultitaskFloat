@@ -1059,6 +1059,7 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
 
 static VoidIMP origMaximizeWindow = NULL;
 static VoidIMP origMinimizeWindow = NULL;
+static VoidIMP origCloseWindow = NULL;
 
 // Window-state toggles: updateVerticalConstraints is only called
 // from the maximized branch (and setup/bar toggle), so restoring
@@ -1067,6 +1068,26 @@ static VoidIMP origMinimizeWindow = NULL;
 // outside the smaller view. Run the layout pass after every
 // maximize/minimize toggle so the clamp (and safe-area fix) apply
 // on both directions.
+// v48: immediate drag-bar removal on close. v47's viewDidDisappear
+// cleanup works, but the host only tears the window down seconds
+// after the close tap, so the bar lingered on the list for a few
+// seconds. closeWindow runs synchronously at tap (the pill's red
+// button calls it directly), so removing the bar here makes it
+// vanish immediately; viewDidDisappear stays as the fallback for
+// any close path that bypasses closeWindow. Clearing the
+// association lets a later sync recreate the bar if the close is
+// somehow undone, and the delayed syncs guard on window so a
+// closed bar is never recreated. Idempotent with viewDidDisappear
+// (whichever runs second sees nil and does nothing).
+static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
+    if (origCloseWindow) origCloseWindow(self, _cmd);
+    UIView *dragBar = objc_getAssociatedObject(self, &kMultitaskFloatDragBarKey);
+    if (dragBar) {
+        [dragBar removeFromSuperview];
+        objc_setAssociatedObject(self, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
     if (origMaximizeWindow) origMaximizeWindow(self, _cmd);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
@@ -1431,6 +1452,21 @@ static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
         // v40: re-assert pinned on top once layout has settled
         // after appear (a new window's appear can bury pinned).
         MultitaskFloatBringPinnedToFront();
+    });
+    // v48: late chrome re-sync. Instagram/Xiaohongshu small windows
+    // are still square on first open (v47): the host resets clipping
+    // after the pop and the 0.5s sync, while the heavy app is still
+    // launching, and no layout fires afterward to re-sync — the
+    // corners only round after the user toggles maximize/restore
+    // (which forces a layout). Re-syncing once more at 2.5s, after
+    // launch has usually settled, rounds the corners automatically
+    // with no toggle. Guarded by window (a closed window never
+    // re-syncs, so a closed bar is never recreated). Idempotent.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
     });
 }
 
@@ -1911,6 +1947,13 @@ static void MultitaskFloatConstructor(void) {
     if (mMin) {
         origMinimizeWindow = (VoidIMP)method_getImplementation(mMin);
         method_setImplementation(mMin, (IMP)MultitaskFloatMinimizeWindow);
+    }
+    // v48: closeWindow — same direct swap (the class defines it).
+    // Removes the drag bar immediately at tap (see function).
+    Method mClose = class_getInstanceMethod(cls, @selector(closeWindow));
+    if (mClose) {
+        origCloseWindow = (VoidIMP)method_getImplementation(mClose);
+        method_setImplementation(mClose, (IMP)MultitaskFloatCloseWindow);
     }
     // Safe-area compensation inside the recompute path (see above):
     // swap the method's implementation for the C function; the
