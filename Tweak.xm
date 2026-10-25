@@ -85,14 +85,22 @@
 // (maximizeWindow, without animation) and then moves it like
 // moveWindow: does. When not maximized the delegate refuses, so the
 // original gesture moves the window exactly as before.
-// v8 notes: v7 loaded fine (user restarted and re-signed) but the strip
-// stayed with a hard cut edge at the top. Cause: the decorated view
-// clips subviews to its bounds (cornerRadius 10, masksToBounds YES),
-// and the scene is a plain subview of it, so the part of the scene
-// shifted above the decorated view's top edge is cut off exactly
-// there — the extension never paints, and the cut reads as a hard
-// line. v8 turns masksToBounds off while maximized so the scene can
-// paint past the decorated view's top edge under the status bar.
+// v9 notes: v8 fixed the strip and the hard edge, but the app's own
+// controls slid up under the status bar (user's bookshelf screenshots:
+// bell/more buttons clipped by the status bar, everything shifted up).
+// Cause: v7/v8 compensated the guest's top safe area with an async
+// updateSettingsWithBlock after the fact, but that change triggers the
+// host's own settings recompute (didUpdate -> updateMaximizedFrame ->
+// updateMaximizedSafeArea), which resets the top inset to 0 — the
+// compensation erased itself, so the scene extension moved content up.
+// v9 moves the compensation INTO the recompute path: it swaps
+// updateMaximizedSafeAreaWithSettings: with a category method (a real
+// ObjC method, so the UIEdgeInsets struct return uses the right ABI)
+// that runs the original computation and then grows the guest's top
+// safe area by the same amount the scene was extended. Every recompute
+// now produces the compensated value, so it can no longer be wiped.
+// The async settings block is removed; the swizzle is the single
+// source of truth for the safe area.
 
 // Minimal interface: only what this tweak touches. The real headers pull in
 // private headers or are Swift-generated, so they cannot be imported here.
@@ -114,6 +122,10 @@
 - (void)maximizeWindow;
 - (void)moveWindow:(UIPanGestureRecognizer *)sender;
 - (void)updateOriginalFrame;
+@end
+
+@interface DecoratedAppSceneViewController (MultitaskFloatSafeArea)
+- (UIEdgeInsets)MultitaskFloat_updateMaximizedSafeAreaWithSettings:(UIMutableApplicationSceneSettings *)settings;
 @end
 
 typedef id (*DecoratedInitIMP)(id, SEL, NSString *, NSString *, NSString *, UIViewController *);
@@ -293,41 +305,10 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
                 [vc.view layoutIfNeeded];
             }];
         }
-        if (maximized && portrait && topOffset > 0) {
-            // The scene grew up by topOffset; grow the guest's top safe
-            // area by the same amount (in guest points) so the app's
-            // top content stays exactly where it was and only
-            // background/map fills the status-bar strip. In maximized
-            // top-bar mode the guest's top base is 0, so setting the
-            // absolute value is idempotent. Async so it lands after
-            // any in-flight settings update (e.g. from maximizeWindow)
-            // instead of being overwritten by it.
-            __weak DecoratedAppSceneViewController *weakVC = vc;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                DecoratedAppSceneViewController *strongVC = weakVC;
-                if (!strongVC || !strongVC.view.window) return;
-                if (!strongVC.isMaximized || strongVC.navigationBar.hidden) return;
-                UIWindow *w = strongVC.view.window;
-                if (w.windowScene && !UIInterfaceOrientationIsPortrait(w.windowScene.interfaceOrientation)) return;
-                CGFloat off = [strongVC.view convertRect:strongVC.view.bounds toView:w].origin.y;
-                if (off <= 0) return;
-                CGFloat scale = 1.0;
-                @try {
-                    NSNumber *n = [strongVC valueForKey:@"scaleRatio"];
-                    double v = [n doubleValue];
-                    if (v > 0) scale = (CGFloat)v;
-                } @catch (id e) {}
-                CGFloat top = off / scale;
-                [strongVC.appSceneVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *s) {
-                    UIEdgeInsets p = s.peripheryInsets;
-                    p.top = top;
-                    s.peripheryInsets = p;
-                    UIEdgeInsets pa = s.safeAreaInsetsPortrait;
-                    pa.top = top;
-                    s.safeAreaInsetsPortrait = pa;
-                }];
-            });
-        }
+        // No settings update here: the guest's top safe area is grown
+        // inside updateMaximizedSafeAreaWithSettings: (see the category
+        // below), so every host recompute produces the compensated
+        // value instead of wiping an after-the-fact update.
     }
     // Keep the dock fully gone even if its view appears late.
     MultitaskFloatHideDockFully();
@@ -382,6 +363,51 @@ static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc) {
     [bar addGestureRecognizer:drag];
 }
 
+@implementation DecoratedAppSceneViewController (MultitaskFloatSafeArea)
+
+// Runs the original maximized safe-area computation, then grows the
+// guest's top safe area by the same amount the scene was extended
+// upward, so the app's top controls stay where they were and only
+// background fills the status-bar strip. This must live inside the
+// recompute path: an after-the-fact settings update gets wiped when
+// the host recomputes (didUpdate -> maximized frame -> this method),
+// but a value produced here survives every recompute, because the
+// original resets the base first and this adds on top each time.
+// The frame insets returned are left untouched: the decorated view
+// itself stays below the status bar; only the scene extends past it.
+// A real ObjC method (not a C-function IMP) so the UIEdgeInsets
+// struct return uses the correct ABI.
+- (UIEdgeInsets)MultitaskFloat_updateMaximizedSafeAreaWithSettings:(UIMutableApplicationSceneSettings *)settings {
+    // After the exchange in the constructor, this selector holds the
+    // original implementation, so this call runs the original
+    // computation.
+    UIEdgeInsets r = [self MultitaskFloat_updateMaximizedSafeAreaWithSettings:settings];
+    if (self.isMaximized && self.view.window) {
+        UIWindow *w = self.view.window;
+        BOOL portrait = YES;
+        if (w.windowScene) portrait = UIInterfaceOrientationIsPortrait(w.windowScene.interfaceOrientation);
+        CGFloat off = [self.view convertRect:self.view.bounds toView:w].origin.y;
+        if (portrait && off > 0) {
+            CGFloat scale = 1.0;
+            @try {
+                NSNumber *n = [self valueForKey:@"scaleRatio"];
+                double v = [n doubleValue];
+                if (v > 0) scale = (CGFloat)v;
+            } @catch (id e) {}
+            CGFloat add = off / scale;
+            UIEdgeInsets p = settings.peripheryInsets;
+            p.top += add;
+            settings.peripheryInsets = p;
+            UIEdgeInsets pa = settings.safeAreaInsetsPortrait;
+            pa.top += add;
+            settings.safeAreaInsetsPortrait = pa;
+        }
+    }
+    return r;
+}
+
+@end
+
 __attribute__((constructor))
 static void MultitaskFloatConstructor(void) {
     // Dyld-init time: ONLY pure runtime calls. No UIKit, no defaults, no
@@ -398,6 +424,15 @@ static void MultitaskFloatConstructor(void) {
     if (mLayout) {
         origUpdateVerticalConstraints = (VoidIMP)method_getImplementation(mLayout);
         method_setImplementation(mLayout, (IMP)MultitaskFloatUpdateVerticalConstraints);
+    }
+    // Safe-area compensation inside the recompute path (see the
+    // category above). The category is attached at load time, so both
+    // methods exist here; after the exchange, the category selector
+    // holds the original implementation.
+    Method mSafe = class_getInstanceMethod(cls, @selector(updateMaximizedSafeAreaWithSettings:));
+    Method mMine = class_getInstanceMethod(cls, @selector(MultitaskFloat_updateMaximizedSafeAreaWithSettings:));
+    if (mSafe && mMine) {
+        method_exchangeImplementations(mSafe, mMine);
     }
     // viewDidAppear: the class does not define it, so adding an override
     // is safe; chain to UIViewController's implementation.
