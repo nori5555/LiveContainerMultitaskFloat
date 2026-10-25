@@ -1011,8 +1011,11 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     // the scaled view does not fill the window, so the LiveContainer
     // list underneath peeks through at the edges — most visible at
     // the bottom, where the list's colorful tab bar shows as a thin
-    // strip (the video's black-loading frames). A black cover below
-    // the decorated view hides the whole underneath during the pop.
+    // strip (the video's black-loading frames). An
+    // appearance-matched cover below the decorated view hides the
+    // whole underneath during the pop. v32: white by day, black by
+    // night — the user corrected v31 here, a black cover is wrong
+    // in daytime.
     // Maximized only: in windowed mode the list around the small
     // window is supposed to be visible. At pop end the view fills
     // the window, so the cover is already fully hidden behind it and
@@ -1021,7 +1024,11 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     UIView *popCover = nil;
     if (vc.isMaximized && vc.view.superview) {
         popCover = [[UIView alloc] initWithFrame:vc.view.superview.bounds];
-        popCover.backgroundColor = [UIColor blackColor];
+        // v32: cover color follows appearance (the user corrected
+        // v31: a black cover is wrong in daytime). Day -> white,
+        // night -> black, matching the host list / guest loading
+        // background on each side of the pop.
+        popCover.backgroundColor = (vc.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? [UIColor blackColor] : [UIColor whiteColor];
         popCover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         popCover.userInteractionEnabled = NO;
         [vc.view.superview insertSubview:popCover belowSubview:vc.view];
