@@ -330,7 +330,6 @@ static BOOL dockSwizzled = NO;
 static const char kMultitaskFloatPillKey = 0;
 static const char kMultitaskFloatPillPlacedKey = 0;
 static const char kMultitaskFloatDragBarKey = 0;
-static const char kMultitaskFloatDidAnimateOpenKey = 0;
 
 // Forward declaration: defined after InitImpl, used by it.
 static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
@@ -884,17 +883,78 @@ static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
     });
 }
 
+// Last tap point, for the icon-origin open animation: the user taps
+// an app icon to open its window, so the last touch-up location is
+// (to within the icon) where the window should grow from. Captured
+// globally via UIWindow sendEvent: (pure runtime swizzle; the
+// replacement itself runs at touch time, never in the constructor).
+// Only used if recent (< 3s) and inside the appearing view;
+// otherwise the animation falls back to a center scale, so an open
+// never shows no animation.
+static CGPoint MultitaskFloatLastTapPoint = {0, 0};
+static NSTimeInterval MultitaskFloatLastTapTime = 0;
+typedef void (*SendEventIMP)(id, SEL, UIEvent *);
+static SendEventIMP origSendEvent = NULL;
+static void MultitaskFloatSendEvent(id self, SEL _cmd, UIEvent *event) {
+    if (origSendEvent) origSendEvent(self, _cmd, event);
+    @try {
+        if (event.type == UIEventTypeTouches) {
+            for (UITouch *touch in event.allTouches) {
+                if (touch.phase == UITouchPhaseEnded && touch.window) {
+                    MultitaskFloatLastTapPoint = [touch locationInView:touch.window];
+                    MultitaskFloatLastTapTime = [[NSDate date] timeIntervalSince1970];
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+}
+
+// Open animation, v25: grow from the tapped icon (like iOS opening
+// an app), not from the center. Every appearance animates: the v23
+// one-shot flag is why a second open showed no animation when the
+// VC was reused. Transform + alpha are independent of the host's
+// frame/constraint animation, so the two compose instead of fighting.
 static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
-    if (!vc.view) return;
-    if (objc_getAssociatedObject(vc, &kMultitaskFloatDidAnimateOpenKey)) return;
-    objc_setAssociatedObject(vc, &kMultitaskFloatDidAnimateOpenKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!vc.view || !vc.view.window) return;
     UIView *view = vc.view;
+    CGPoint anchor = CGPointMake(0.5, 0.5);
+    CGFloat startScale = 0.94;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - MultitaskFloatLastTapTime < 3.0 && view.bounds.size.width > 0 && view.bounds.size.height > 0) {
+        CGPoint ptInView = [view convertPoint:MultitaskFloatLastTapPoint fromView:view.window];
+        if (ptInView.x >= 0 && ptInView.x <= view.bounds.size.width && ptInView.y >= 0 && ptInView.y <= view.bounds.size.height) {
+            anchor = CGPointMake(ptInView.x / view.bounds.size.width, ptInView.y / view.bounds.size.height);
+            startScale = 0.3;
+        }
+    }
+    // Scale around the anchor: set the layer anchor (with position
+    // compensation so the view does not jump), then spring to identity.
+    CALayer *layer = view.layer;
+    CGPoint oldAnchor = layer.anchorPoint;
+    CGPoint oldPoint = CGPointMake(view.bounds.size.width * oldAnchor.x, view.bounds.size.height * oldAnchor.y);
+    CGPoint newPoint = CGPointMake(view.bounds.size.width * anchor.x, view.bounds.size.height * anchor.y);
+    CGPoint pos = layer.position;
+    pos.x -= oldPoint.x; pos.x += newPoint.x;
+    pos.y -= oldPoint.y; pos.y += newPoint.y;
+    layer.position = pos;
+    layer.anchorPoint = anchor;
     view.alpha = 0;
-    view.transform = CGAffineTransformMakeScale(0.94, 0.94);
-    [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+    view.transform = CGAffineTransformMakeScale(startScale, startScale);
+    [UIView animateWithDuration:0.4 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
         view.alpha = 1;
         view.transform = CGAffineTransformIdentity;
-    } completion:nil];
+    } completion:^(BOOL finished) {
+        // Restore the default anchor (invisible: transform is identity).
+        CALayer *l = view.layer;
+        CGPoint curAnchor = l.anchorPoint;
+        CGPoint curPoint = CGPointMake(view.bounds.size.width * curAnchor.x, view.bounds.size.height * curAnchor.y);
+        CGPoint defPoint = CGPointMake(view.bounds.size.width * 0.5, view.bounds.size.height * 0.5);
+        CGPoint p = l.position;
+        p.x -= curPoint.x; p.x += defPoint.x;
+        p.y -= curPoint.y; p.y += defPoint.y;
+        l.position = p;
+        l.anchorPoint = CGPointMake(0.5, 0.5);
+    }];
 }
 
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
@@ -1150,4 +1210,15 @@ static void MultitaskFloatConstructor(void) {
     // Floating pill handlers are new selectors too, so adding them is safe.
     class_addMethod(cls, @selector(MultitaskFloatPillPan:), (IMP)MultitaskFloatPillPan, "v@:@");
     class_addMethod(cls, @selector(MultitaskFloatPillButton:), (IMP)MultitaskFloatPillButton, "v@:@");
+    // Last-tap capture for the icon-origin open animation: UIWindow
+    // implements sendEvent:, so swap its implementation (orig first,
+    // then record). Pure runtime, no UIKit work in the constructor.
+    Class windowCls = objc_getClass("UIWindow");
+    if (windowCls) {
+        Method mSend = class_getInstanceMethod(windowCls, @selector(sendEvent:));
+        if (mSend) {
+            origSendEvent = (SendEventIMP)method_getImplementation(mSend);
+            method_setImplementation(mSend, (IMP)MultitaskFloatSendEvent);
+        }
+    }
 }
