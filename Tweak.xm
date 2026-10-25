@@ -506,6 +506,17 @@ static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSStri
 // it anywhere (AssistiveTouch-style) instead of having it fixed at the
 // top-right blocking the app's own controls. Taps still work: the pan
 // only takes over once the finger moves, otherwise the button fires.
+// Pill border follows appearance (v27): black in light mode, white
+// in dark mode (day-black / night-white). A layer borderColor is a
+// resolved CGColor, so it does not follow trait changes on its own —
+// it must be re-applied on every sync.
+static void MultitaskFloatApplyPillBorder(UIView *pill, UIView *view) {
+    if (!pill || !view) return;
+    BOOL dark = (view.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    UIColor *c = dark ? [[UIColor whiteColor] colorWithAlphaComponent:0.6] : [[UIColor blackColor] colorWithAlphaComponent:0.6];
+    pill.layer.borderColor = c.CGColor;
+}
+
 static void MultitaskFloatSyncPill(DecoratedAppSceneViewController *vc) {
     if (!vc) return;
     UIView *pill = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
@@ -519,6 +530,7 @@ static void MultitaskFloatSyncPill(DecoratedAppSceneViewController *vc) {
             break;
         }
     }
+    MultitaskFloatApplyPillBorder(pill, vc.view);
 }
 
 static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sender) {
@@ -593,8 +605,8 @@ static void MultitaskFloatAddFloatingPill(DecoratedAppSceneViewController *vc) {
     // view itself still clips to the pill shape (see below), and the
     // buttons sit inset by pad, so nothing overflows the rounded rect.
     pill.layer.masksToBounds = NO;
-    pill.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.6].CGColor;
     pill.layer.borderWidth = 1.0;
+    MultitaskFloatApplyPillBorder(pill, vc.view);
     pill.layer.shadowColor = [[UIColor blackColor] CGColor];
     pill.layer.shadowOpacity = 0.15;
     pill.layer.shadowRadius = 8;
@@ -700,6 +712,11 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         UIView *pillTop = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
         if (pillTop) [vc.view bringSubviewToFront:pillTop];
     }
+    // Pill border follows appearance (v27): re-applied on every
+    // layout pass, so a system day/night switch recolors it without
+    // waiting for a maximize/minimize.
+    UIView *pillBorder = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
+    if (pillBorder) MultitaskFloatApplyPillBorder(pillBorder, vc.view);
 }
 
 static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
@@ -954,7 +971,10 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     layer.anchorPoint = anchor;
     view.alpha = 0;
     view.transform = CGAffineTransformMakeScale(startScale, startScale);
-    [UIView animateWithDuration:0.4 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+    // v27: push-style timing (system nav push: 0.35s ease-in-out,
+    // no overshoot) instead of a spring — the spring's bounce is
+    // what made the zoom feel unlike the system animation.
+    [UIView animateWithDuration:0.35 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
         view.alpha = 1;
         view.transform = CGAffineTransformIdentity;
     } completion:^(BOOL finished) {
