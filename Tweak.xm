@@ -1042,7 +1042,7 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     // border, night -> white border (foreground contrast, like
     // the pill border — opposite of the background-matching
     // cover). Starts at 0.5x and expands to 3.5x while fading
-    // out over 0.45s (ease-out), concurrent with the shortened
+    // out over 0.6s (ease-out, v36: was 0.45s), concurrent with the shortened
     // pop. Removed in its own completion, so it can never
     // outlive the animation even if the window closes
     // mid-flight.
@@ -1053,7 +1053,7 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         circleView.backgroundColor = [UIColor clearColor];
         circleView.userInteractionEnabled = NO;
         circleView.layer.cornerRadius = circleSize * 0.5;
-        circleView.layer.borderWidth = 2.5;
+        circleView.layer.borderWidth = 4.0;  // v36: bolder (was 2.5)
         circleView.layer.borderColor = (vc.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) ? [UIColor whiteColor].CGColor : [UIColor blackColor].CGColor;
         circleView.center = CGPointMake(CGRectGetMidX(vc.view.superview.bounds), CGRectGetMidY(vc.view.superview.bounds));
         circleView.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
@@ -1118,8 +1118,10 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     }];
     // v35: circle ripple expand + fade (concurrent with the
     // pop, not after it, so it adds no extra time).
+    // v36: duration 0.45 -> 0.6s (the user asked for a longer
+    // ripple, so it lingers a bit after the pop settles).
     if (circleView) {
-        [UIView animateWithDuration:0.45 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        [UIView animateWithDuration:0.6 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
             circleView.transform = CGAffineTransformMakeScale(3.5, 3.5);
             circleView.alpha = 0;
         } completion:^(BOOL circleFinished) {
