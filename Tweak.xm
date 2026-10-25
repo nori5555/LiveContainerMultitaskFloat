@@ -96,6 +96,25 @@
 // definition class of error as v10's pill call); fixed with a forward
 // declaration, as with AddDragGesture and AddFloatingPill.
 //
+// v14 notes (2026-10-25): v13 still left the sidebar up and the top
+// slid up (user video 15:46: expanded dock with collapse chevron,
+// minimize-all and an app icon, top still high). Root causes:
+// (1) DockManagerClass used class_respondsToSelector to test +shared,
+// but that function checks INSTANCE methods only, so it always
+// returned NO for a class method and the dock code silently never
+// ran in v5/v6/v11/v13 (crash fixed, dock never hidden). Fixed with
+// class_getClassMethod, the correct test for a class method.
+// (2) isCollapsed was set via KVC, which @Published properties do
+// not reliably accept; now set via the real setIsCollapsed: setter
+// (guarded, KVC fallback). (3) showDock re-adds the hosting view
+// and was never redirected; now redirected to the hide helper too.
+// (4) Top compensation derived off from the view's current frame,
+// which is not final at first recompute / on maximize; now derived
+// from the window's top safe-area inset (final from window creation,
+// equal to the decorated view's final origin.y), and the fix is
+// pushed from ApplyLayout so it covers maximize as well as
+// appearance.
+//
 // Install: put the built dylib in the global Tweaks folder, sign it, then
 // in LiveContainer Settings tap the version number 5 times and enable
 // "Load Tweaks to LiveContainer Itself", and restart LiveContainer. The
@@ -226,7 +245,13 @@ static Class MultitaskFloatDockManagerClass(void) {
         if (strcmp(class_getName(c), "NSObject") == 0) { isNSObjectDerived = YES; break; }
     }
     if (!isNSObjectDerived) return Nil;
-    if (!class_respondsToSelector(cls, @selector(shared))) return Nil;
+    // NOTE (v14 fix): class_respondsToSelector checks INSTANCE methods
+    // only, so it always returns NO for +shared (a class method) and
+    // this function always returned Nil — which is why the dock code
+    // silently never ran in v5/v6/v11/v13 even though the crash was
+    // fixed. class_getClassMethod checks the metaclass, which is the
+    // correct test for a class method.
+    if (!class_getClassMethod(cls, @selector(shared))) return Nil;
     return cls;
 }
 
@@ -251,10 +276,23 @@ static void MultitaskFloatHideDockManager(id manager) {
     // defaults, read by the dock view on launch) makes the collapsed
     // dock render at 0.01 opacity instead of the 0.4 sliver. Each write
     // is guarded so it only fires once; failures are ignored.
+    // Use the real setter (not KVC) for isCollapsed: @Published
+    // properties do not reliably accept KVC writes, but the @objc
+    // setter does notify SwiftUI. Fall back to KVC if no setter.
     @try {
-        id collapsed = [manager valueForKey:@"isCollapsed"];
-        if (!collapsed || ![collapsed boolValue]) {
-            [manager setValue:@YES forKey:@"isCollapsed"];
+        BOOL collapsed = NO;
+        if ([manager respondsToSelector:@selector(isCollapsed)]) {
+            collapsed = ((BOOL (*)(id, SEL))objc_msgSend)(manager, @selector(isCollapsed));
+        } else {
+            id v = [manager valueForKey:@"isCollapsed"];
+            collapsed = v ? [v boolValue] : NO;
+        }
+        if (!collapsed) {
+            if ([manager respondsToSelector:@selector(setIsCollapsed:)]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(manager, @selector(setIsCollapsed:), YES);
+            } else {
+                [manager setValue:@YES forKey:@"isCollapsed"];
+            }
         }
     } @catch (id e) {}
     @try {
@@ -293,8 +331,14 @@ static void MultitaskFloatSwizzleDock(void) {
     Class cls = MultitaskFloatDockManagerClass();
     if (!cls) return;
     // Only redirect the re-show paths when the hide path actually exists,
-    // so the redirect never sends an unimplemented selector.
+    // so the redirect never sends an unimplemented selector. showDock
+    // is redirected too: it re-adds the hosting view and animates it
+    // to full alpha, so leaving it alone would bring the dock back
+    // even with the other paths redirected. Redirecting to the hide
+    // helper (a supported hide, not a no-op) keeps state consistent.
     if (!class_getInstanceMethod(cls, @selector(hideDockToSide))) return;
+    Method mShowDock = class_getInstanceMethod(cls, @selector(showDock));
+    if (mShowDock) method_setImplementation(mShowDock, (IMP)MultitaskFloatForceHideDock);
     Method mShow = class_getInstanceMethod(cls, @selector(showDockFromHidden));
     if (mShow) method_setImplementation(mShow, (IMP)MultitaskFloatForceHideDock);
     Method mToggle = class_getInstanceMethod(cls, @selector(toggleDockVisibility));
@@ -443,6 +487,9 @@ static void MultitaskFloatAddFloatingPill(DecoratedAppSceneViewController *vc) {
     objc_setAssociatedObject(vc, &kMultitaskFloatPillPlacedKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+// Forward declaration: defined after ViewDidAppear, used by ApplyLayout.
+static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc);
+
 // Shared layout pass: strip the bar, extend the scene, hide the dock.
 // Called from updateVerticalConstraints (covers maximize/restore and bar
 // toggles) and from viewDidAppear (covers first appearance, when the
@@ -455,9 +502,11 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
         CGFloat topOffset = 0;
         BOOL portrait = YES;
         if (maximized && vc.view.window) {
-            topOffset = [vc.view convertRect:vc.view.bounds toView:vc.view.window].origin.y;
             UIWindowScene *ws = vc.view.window.windowScene;
             if (ws) portrait = UIInterfaceOrientationIsPortrait(ws.interfaceOrientation);
+            // Timing-independent (see the swizzle): the final origin.y
+            // equals the window's top safe-area inset.
+            if (portrait) topOffset = vc.view.window.safeAreaInsets.top;
         }
         if (maximized) {
             // The decorated view clips subviews to its bounds
@@ -523,6 +572,10 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
     }
     // Keep the pill's maximize icon in step with the window state.
     MultitaskFloatSyncPill(vc);
+    // Push the compensated safe area (covers appearance AND maximize:
+    // ApplyLayout runs on both paths, and the fix re-checks state on
+    // its async tick, so it is idempotent).
+    MultitaskFloatFixTopSafeArea(vc);
 }
 
 static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
@@ -530,13 +583,9 @@ static void MultitaskFloatUpdateVerticalConstraints(id self, SEL _cmd) {
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
 }
 
-// Forward declaration: defined after ViewDidAppear, used by it.
-static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc);
-
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
-    MultitaskFloatFixTopSafeArea((DecoratedAppSceneViewController *)self);
 }
 
 // The initial maximized recompute runs before the decorated view's
@@ -558,7 +607,9 @@ static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc) {
         BOOL portrait = YES;
         if (w.windowScene) portrait = UIInterfaceOrientationIsPortrait(w.windowScene.interfaceOrientation);
         if (!portrait) return;
-        CGFloat off = [vc.view convertRect:vc.view.bounds toView:w].origin.y;
+        // Timing-independent (see the swizzle): use the window's top
+        // safe-area inset, not the view's current frame origin.
+        CGFloat off = w.safeAreaInsets.top;
         if (off <= 0) return;
         CGFloat scale = 1.0;
         @try {
@@ -649,7 +700,13 @@ static UIEdgeInsets MultitaskFloatMaximizedSafeArea(id self, SEL _cmd, UIMutable
         UIWindow *w = vc.view.window;
         BOOL portrait = YES;
         if (w.windowScene) portrait = UIInterfaceOrientationIsPortrait(w.windowScene.interfaceOrientation);
-        CGFloat off = [vc.view convertRect:vc.view.bounds toView:w].origin.y;
+        // Timing-independent: the decorated view's final origin.y in
+        // the window equals the window's top safe-area inset (the host
+        // sets maxFrame by insetting the window frame by it), but the
+        // view's current frame may not be final yet when this runs
+        // (setup/activation), which used to yield off = 0. The window
+        // safe area is final from window creation.
+        CGFloat off = w.safeAreaInsets.top;
         if (portrait && off > 0) {
             CGFloat scale = 1.0;
             @try {
