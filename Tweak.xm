@@ -1145,7 +1145,7 @@ static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
         }
     });
     // v53: restart the per-frame link on every toggle, so a
-    // maximize/restore after the appear link stopped (30s) is still
+    // maximize/restore after the appear link stopped (5s) is still
     // covered continuously (a single 0.35s sync can miss a late host
     // reset, which is why restore-then-click was probabilistically
     // square). StartDisplayLink is idempotent: a running link is a
@@ -1519,7 +1519,7 @@ static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
 // looks round once the host stops resetting. A display link
 // re-applies chrome every frame, so the window reads as round
 // from the start (at most one frame of square after a reset),
-// instead of waiting for the next timer. Runs 30s (polls to 30s
+// instead of waiting for the next timer. Runs 5s (polls to 30s
 // remain as fallback), stops early on close (viewDidDisappear)
 // or nil window, skips when maximized (no corners to fix there,
 // link stays alive for restore). Idempotent; guard prevents
@@ -1544,7 +1544,7 @@ static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
     @try {
         NSTimeInterval start = [objc_getAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey) doubleValue];
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (!vc.view.window || (start > 0 && now - start > 30.0)) {
+        if (!vc.view.window || (start > 0 && now - start > 5.0)) {
             ((void (*)(id, SEL))objc_msgSend)(link, @selector(invalidate));
             objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
