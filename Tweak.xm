@@ -353,6 +353,7 @@ static const char kMultitaskFloatClosingKey = 0;
 static const char kMultitaskFloatDockedKey = 0;
 static const char kMultitaskFloatDockTabKey = 0;
 static const char kMultitaskFloatDockWindowKey = 0; // v61: separate window so the tab stays above any app
+static const char kMultitaskFloatDockAnimatingKey = 0; // v66: dock/restore animation in flight
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -642,6 +643,11 @@ static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc);
 
 static void MultitaskFloatPillButton(id self, SEL _cmd, UIButton *sender) {
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    // v66: ignore pill taps while a dock/restore animation is in
+    // flight (0.25s) — a second tap in that window used to call
+    // minimizeWindow against a sliding, fading window, and the
+    // host move + our transform fought to a side position.
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) return;
     if (sender.tag == 0) {
         // v60: pinned + yellow minimize docks to the edge instead of
         // minimizing normally — a blue drag bar means pinned; tapping
@@ -1717,6 +1723,13 @@ static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
     // v60: also drop the edge-dock tab + docked flag, so a docked
     // window that goes away leaves no lingering tab.
     // v61: also hide + drop the dock window (the tab lives in it now).
+    // v66: if it was docked when it went away (host terminate path,
+    // not tab-restore), also reset the view itself — otherwise the
+    // off-screen-left transform + hidden + alpha 0 survive for a
+    // later layout-only reappear, and the small window never shows.
+    // Disappearing means it is already off-screen, so resetting
+    // here cannot flash anything.
+    BOOL wasDocked = [objc_getAssociatedObject(self, &kMultitaskFloatDockedKey) boolValue];
     UIWindow *dockWindow = objc_getAssociatedObject(self, &kMultitaskFloatDockWindowKey);
     if (dockWindow) dockWindow.hidden = YES;
     objc_setAssociatedObject(self, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1724,7 +1737,16 @@ static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
     if (dockTab) [dockTab removeFromSuperview];
     objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(self, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &kMultitaskFloatDockAnimatingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (MultitaskFloatDockedVC == self) MultitaskFloatDockedVC = nil; // v63: dock slot frees on disappear
+    if (wasDocked) {
+        UIView *goneView = ((DecoratedAppSceneViewController *)self).view;
+        if (goneView) {
+            goneView.transform = CGAffineTransformIdentity;
+            goneView.alpha = 1;
+            goneView.hidden = NO;
+        }
+    }
     // v51: stop the per-frame link when the window goes away, so a
     // closed window never keeps ticking (the tick also stops itself
     // on nil window, this is the prompt path).
@@ -1796,6 +1818,26 @@ static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    // v66: a window reappearing after its app was terminated must
+    // not keep dock leftovers — a docked window killed via a host
+    // path (not tab-restore, not red close) kept hidden=YES,
+    // transform off-screen-left and alpha 0, so it reappeared
+    // invisible. Appearing means it must be shown, so drop the
+    // dock state and reset the view before the open pop.
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue] || [objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) {
+        UIWindow *oldDockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
+        if (oldDockWindow) oldDockWindow.hidden = YES;
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UIView *oldDockTab = objc_getAssociatedObject(vc, &kMultitaskFloatDockTabKey);
+        if (oldDockTab) [oldDockTab removeFromSuperview];
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (MultitaskFloatDockedVC == vc) MultitaskFloatDockedVC = nil;
+        vc.view.hidden = NO;
+        vc.view.transform = CGAffineTransformIdentity;
+        vc.view.alpha = 1;
+    }
     MultitaskFloatAnimateOpen(vc);
     MultitaskFloatApplyLayout(vc);
     // Delayed full recompute: the user's diagnostics (v17) show that
@@ -2053,6 +2095,10 @@ static void MultitaskFloatTogglePin(id self, SEL _cmd, UITapGestureRecognizer *s
 // not unpinning).
 static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     if (!vc.view || !vc.view.window || !vc.view.superview) return;
+    // v66: a dock already sliding must not be re-entered — repeated
+    // taps in the slide window stacked a second dock/minimize on
+    // top of the first and left the window at a side position.
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) return;
     if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
     // v63: only one docked window — if a DIFFERENT window is already
     // docked, prompt and refuse this dock (leave this window as it
@@ -2127,6 +2173,7 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     }
     objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MultitaskFloatDockedVC = vc; // v63: single dock — record the docked window
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
     // Slide the window off-screen toward the dock edge + fade out;
     // the drag bar fades where it was (it does not slide with the
@@ -2145,12 +2192,17 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         vc.view.hidden = YES;
         if (dragBar) dragBar.hidden = YES;
         dockWindow.hidden = NO;
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
     }];
 }
 
 static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
     if (!vc.view) return;
+    // v66: same in-flight guard as DockToEdge — a second restore
+    // tap mid-slide must not re-run the slide-back.
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) return;
     if (![objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
     // Hide the dock window first: the window slides back from the
     // edge as the tab vanishes, so the tab reads as becoming the
     // window. Hiding + clearing the window also releases the tab
@@ -2187,6 +2239,7 @@ static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
         if (dragBar && showBar) dragBar.alpha = 1;
     } completion:^(BOOL finished) {
         (void)finished;
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
         MultitaskFloatSyncWindowChrome(vc);
         MultitaskFloatStartDisplayLink(vc);
     }];
