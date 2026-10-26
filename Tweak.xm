@@ -5,6 +5,17 @@
 #import <string.h>
 #import <stdlib.h>
 
+// v73: the open animation is Swift-only (see the helpers before
+// MultitaskFloatAnimateOpen). Prefer the generated -Swift.h header
+// (compile-time binding, no lookup at all); if Theos did not put
+// it on the header path, the helpers reach the same Swift methods
+// through the runtime instead. Either way the animation is Swift —
+// there is no ObjC animation fallback anymore.
+#if __has_include("MultitaskFloat-Swift.h")
+#import "MultitaskFloat-Swift.h"
+#define MULTITASKFLOAT_SWIFT_DIRECT 1
+#endif
+
 // LiveContainer's multitasking virtual windows are DecoratedAppSceneViewController:
 // a vertical stack of [44pt UINavigationBar, content]. The bar holds the app
 // title (with its title menu, the "AssppPro v" control) and three
@@ -1476,6 +1487,57 @@ static void MultitaskFloatSendEvent(id self, SEL _cmd, UIEvent *event) {
     } @catch (NSException *e) {}
 }
 
+// v73: Swift-only open-animation drivers. The animation itself is
+// always Swift (UIViewPropertyAnimator in OpenAnimation.swift) — the
+// only difference between the two routes below is how the Swift
+// methods are reached. If the Swift class is somehow absent, the
+// window is set straight to its final state with no animation (and
+// the completion still runs), so it can never stick mid-pop.
+static void MultitaskFloatSwiftPop(UIView *view, CGFloat startScale, CGFloat finalRadius, void (^completion)(void)) {
+#if MULTITASKFLOAT_SWIFT_DIRECT
+    [MultitaskFloatOpenAnimator animatePopWithView:view fromScale:startScale finalRadius:finalRadius completion:completion];
+#else
+    Class cls = objc_getClass("MultitaskFloatOpenAnimator");
+    if (cls) {
+        typedef void (*MultitaskFloatSwiftPopIMP)(id, SEL, UIView *, CGFloat, CGFloat, void (^)(void));
+        ((MultitaskFloatSwiftPopIMP)objc_msgSend)(cls, @selector(animatePopWithView:fromScale:finalRadius:completion:), view, startScale, finalRadius, completion);
+    } else {
+        view.alpha = 1;
+        view.transform = CGAffineTransformIdentity;
+        view.layer.cornerRadius = finalRadius;
+        if (completion) completion();
+    }
+#endif
+}
+
+static void MultitaskFloatSwiftFadeCover(UIView *cover) {
+#if MULTITASKFLOAT_SWIFT_DIRECT
+    [MultitaskFloatOpenAnimator fadeCover:cover];
+#else
+    Class cls = objc_getClass("MultitaskFloatOpenAnimator");
+    if (cls) {
+        typedef void (*MultitaskFloatFadeCoverIMP)(id, SEL, UIView *);
+        ((MultitaskFloatFadeCoverIMP)objc_msgSend)(cls, @selector(fadeCover:), cover);
+    } else {
+        [cover removeFromSuperview];
+    }
+#endif
+}
+
+static void MultitaskFloatSwiftHandwriting(UIView *container, NSArray *clips, NSArray *widths) {
+#if MULTITASKFLOAT_SWIFT_DIRECT
+    [MultitaskFloatOpenAnimator animateHandwritingWithContainer:container clips:(NSArray<UIView *> *)clips widths:(NSArray<NSNumber *> *)widths];
+#else
+    Class cls = objc_getClass("MultitaskFloatOpenAnimator");
+    if (cls) {
+        typedef void (*MultitaskFloatHandwritingIMP)(id, SEL, UIView *, NSArray *, NSArray *);
+        ((MultitaskFloatHandwritingIMP)objc_msgSend)(cls, @selector(animateHandwritingWithContainer:clips:widths:), container, clips, widths);
+    } else {
+        [container removeFromSuperview];
+    }
+#endif
+}
+
 // Open animation, v25: grow from the tapped icon (like iOS opening
 // an app), not from the center. Every appearance animates: the v23
 // one-shot flag is why a second open showed no animation when the
@@ -1640,16 +1702,11 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
             [vc.view.superview addSubview:nameContainer];
         }
     }
-    // v72: the whole open animation now runs through Swift's native
-    // animation API (UIViewPropertyAnimator in OpenAnimation.swift):
-    // the pop (spring), the cover fade, and the handwriting reveal.
-    // Same start/end states and timing as the old ObjC drivers, only
-    // the driver changes. The completion below is unchanged: restore
-    // the anchor, settle chrome, recompute, fade the cover. If the
-    // Swift class is missing at runtime (Swift did not link), fall
-    // back to the old ObjC animations so the open still animates.
-    Class swiftAnimatorCls = objc_getClass("MultitaskFloatOpenAnimator");
-    SEL swiftPopSel = @selector(animatePopWithView:fromScale:finalRadius:completion:);
+    // v73: the whole open animation is Swift-only (see the helpers
+    // above): the pop, the cover fade, and the handwriting reveal
+    // all run through UIViewPropertyAnimator in OpenAnimation.swift.
+    // The completion below is unchanged: restore the anchor, settle
+    // chrome, recompute, fade the cover.
     void (^popCompletion)(void) = ^{
         objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1693,68 +1750,19 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         // can never outlive the fade even if the window closes
         // mid-fade. No-op when there is no cover (e.g. windowed
         // mode).
-        // v72: the cover fade now runs through Swift's native
-        // animation API too (fadeCover: in OpenAnimation.swift),
-        // with the old ObjC fade as fallback if Swift did not link.
         if (popCover) {
-            SEL fadeSel = @selector(fadeCover:);
-            if (swiftAnimatorCls && [swiftAnimatorCls respondsToSelector:fadeSel]) {
-                typedef void (*MultitaskFloatFadeCoverIMP)(id, SEL, UIView *);
-                ((MultitaskFloatFadeCoverIMP)objc_msgSend)(swiftAnimatorCls, fadeSel, popCover);
-            } else {
-                [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-                    popCover.alpha = 0;
-                } completion:^(BOOL fadeFinished) {
-                    (void)fadeFinished;
-                    [popCover removeFromSuperview];
-                }];
-            }
+            MultitaskFloatSwiftFadeCover(popCover);
         }
     };
-    if (swiftAnimatorCls && [swiftAnimatorCls respondsToSelector:swiftPopSel]) {
-        typedef void (*MultitaskFloatSwiftPopIMP)(id, SEL, UIView *, CGFloat, CGFloat, void (^)(void));
-        ((MultitaskFloatSwiftPopIMP)objc_msgSend)(swiftAnimatorCls, swiftPopSel, view, startScale, finalRadius, popCompletion);
-    } else {
-        [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:0 animations:^{
-            view.alpha = 1;
-            view.transform = CGAffineTransformIdentity;
-            view.layer.cornerRadius = finalRadius;
-        } completion:^(BOOL finished) {
-            (void)finished;
-            popCompletion();
-        }];
-    }
-    // v39: filled-stroke reveal (timing unchanged, driver now Swift
-    // in v72 — see below): each glyph's filled ink widens left to
-    // right over 0.22s, staggered 0.12s apart (14 glyphs -> last one
-    // finishes at ~1.78s), concurrent with the pop. Then the whole
-    // container fades out over 0.15s and is removed (~1.9s total),
-    // so the strokes present slowly and linger a bit after the pop
-    // settles.
+    MultitaskFloatSwiftPop(view, startScale, finalRadius, popCompletion);
+    // v39: filled-stroke reveal (timing unchanged, driver Swift
+    // since v72): each glyph's filled ink widens left to right over
+    // 0.22s, staggered 0.12s apart (14 glyphs -> last one finishes
+    // at ~1.78s), concurrent with the pop. Then the whole container
+    // fades out over 0.15s and is removed (~1.9s total), so the
+    // strokes present slowly and linger a bit after the pop settles.
     if (nameContainer) {
-        SEL handwritingSel = @selector(animateHandwritingWithContainer:clips:widths:);
-        if (swiftAnimatorCls && [swiftAnimatorCls respondsToSelector:handwritingSel]) {
-            typedef void (*MultitaskFloatHandwritingIMP)(id, SEL, UIView *, NSArray *, NSArray *);
-            ((MultitaskFloatHandwritingIMP)objc_msgSend)(swiftAnimatorCls, handwritingSel, nameContainer, nameClips, nameClipWidths);
-        } else {
-            // Fallback if Swift did not link: the old ObjC drivers.
-            for (NSUInteger i = 0; i < nameClips.count; i++) {
-                UIView *clipView = nameClips[i];
-                CGFloat targetWidth = [nameClipWidths[i] floatValue];
-                CGRect clipFrame = clipView.frame;
-                [UIView animateWithDuration:0.22 delay:(i * 0.12) options:UIViewAnimationOptionCurveEaseOut animations:^{
-                    clipView.frame = CGRectMake(clipFrame.origin.x, clipFrame.origin.y, targetWidth, clipFrame.size.height);
-                } completion:nil];
-            }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.78 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-                    nameContainer.alpha = 0;
-                } completion:^(BOOL nameFinished) {
-                    (void)nameFinished;
-                    [nameContainer removeFromSuperview];
-                }];
-            });
-        }
+        MultitaskFloatSwiftHandwriting(nameContainer, nameClips, nameClipWidths);
     }
 }
 
