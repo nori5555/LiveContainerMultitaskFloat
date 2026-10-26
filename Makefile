@@ -6,6 +6,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME := MultitaskFloat
 
 MultitaskFloat_FILES := Tweak.xm
+MultitaskFloat_SWIFT_FILES := OpenAnimation.swift
 MultitaskFloat_CFLAGS := -fobjc-arc
 MultitaskFloat_FRAMEWORKS := UIKit CoreText
 

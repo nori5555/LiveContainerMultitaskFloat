@@ -1617,12 +1617,15 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
             [vc.view.superview addSubview:nameContainer];
         }
     }
-    [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:0 animations:^{
-        view.alpha = 1;
-        view.transform = CGAffineTransformIdentity;
-        view.layer.cornerRadius = finalRadius;
-    } completion:^(BOOL finished) {
-        (void)finished;
+    // v69: the pop now runs through Swift's native spring API
+    // (UIViewPropertyAnimator + UISpringTimingParameters, in
+    // OpenAnimation.swift). Same start/end states as the old ObjC
+    // spring, only the driver changes. The completion below is
+    // unchanged: restore the anchor, settle chrome, recompute, fade
+    // the cover. If the Swift class is missing at runtime (Swift
+    // did not link), fall back to the old ObjC spring so the open
+    // still animates.
+    void (^popCompletion)(void) = ^{
         objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // Restore the default anchor (invisible: transform is identity).
         CALayer *l = view.layer;
@@ -1672,7 +1675,22 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
                 [popCover removeFromSuperview];
             }];
         }
-    }];
+    };
+    Class swiftAnimatorCls = objc_getClass("MultitaskFloatOpenAnimator");
+    SEL swiftPopSel = @selector(animatePopWithView:fromScale:finalRadius:completion:);
+    if (swiftAnimatorCls && [swiftAnimatorCls respondsToSelector:swiftPopSel]) {
+        typedef void (*MultitaskFloatSwiftPopIMP)(id, SEL, UIView *, CGFloat, CGFloat, void (^)(void));
+        ((MultitaskFloatSwiftPopIMP)objc_msgSend)(swiftAnimatorCls, swiftPopSel, view, startScale, finalRadius, popCompletion);
+    } else {
+        [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:0 animations:^{
+            view.alpha = 1;
+            view.transform = CGAffineTransformIdentity;
+            view.layer.cornerRadius = finalRadius;
+        } completion:^(BOOL finished) {
+            (void)finished;
+            popCompletion();
+        }];
+    }
     // v39: filled-stroke reveal: each glyph's filled ink
     // widens left to right over 0.22s (the clip view's width
     // grows from 0 to the full glyph width), staggered
