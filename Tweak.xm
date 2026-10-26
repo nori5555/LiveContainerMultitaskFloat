@@ -348,7 +348,7 @@ static const char kMultitaskFloatMaskBoundsKey = 0;
 static const char kMultitaskFloatMaskRadiusKey = 0;
 static const char kMultitaskFloatPillBorderDarkKey = 0;
 static const char kMultitaskFloatPinCapsulePinnedKey = 0;
-static const char kMultitaskFloatForceSmallKey = 0;
+static const char kMultitaskFloatToggleTimeKey = 0;
 static const char kMultitaskFloatClosingKey = 0;
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
@@ -817,17 +817,22 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     // clipping outright). The drag bar and pill border below still
     // sync. The animation's completion re-syncs chrome itself.
     BOOL animatingOpen = [objc_getAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey) boolValue];
-    // v56: force small-window chrome during a shrink animation.
-    // The toggle animates over ~0.3s and isMaximized can stay stale
-    // (still maximized) through it, so a plain isMaximized check
-    // keeps the mask cleared and the corners square for the whole
-    // shrink, then snaps rounded at landing — the square flash on
-    // minimize/restore. Minimize (and a maximize-toggle that
-    // restores) set this flag; every later toggle overwrites it, and
-    // YES + not-maximized is identical to NO + not-maximized, so no
-    // explicit clear is needed.
-    BOOL forceSmall = [objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue];
-    BOOL effectiveMaximized = vc.isMaximized && !forceSmall;
+    // v58: force rounded chrome during ANY toggle animation
+    // (maximize and minimize/restore). The toggle animates over
+    // ~0.3s and isMaximized can stay stale through it, so a plain
+    // isMaximized check snaps corners at toggle start (maximize:
+    // small window snaps square before growing) or at landing
+    // (minimize: square until landing — the v56 flash). During
+    // 0.4s after any toggle, treat the window as not-maximized
+    // (rounded) regardless of the flag; after the window, trust
+    // the host flag (which has caught up by then). The timestamp
+    // expires on its own — no flag to clear, no lingering state
+    // (supersedes v56's forceSmall flag, which would have kept a
+    // maximized window rounded if it lingered).
+    NSNumber *toggleTime = objc_getAssociatedObject(vc, &kMultitaskFloatToggleTimeKey);
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    BOOL inToggle = toggleTime && (now - [toggleTime doubleValue] < 0.4);
+    BOOL effectiveMaximized = inToggle ? NO : vc.isMaximized;
     if (!animatingOpen) {
         // v57 perf: only write layer properties when they actually
         // change — setting the same cornerRadius/masksToBounds every
@@ -937,8 +942,18 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         // almost never parked exactly at top-center.
         UIView *parent = vc.view.superview;
         if (parent) {
-            CGFloat windowTop = vc.view.frame.origin.y;
-            CGFloat windowMidX = vc.view.frame.origin.x + vc.view.frame.size.width / 2;
+            // v58: during a toggle animation, the model frame is
+            // already final while the presentation is still
+            // animating — position the bar from the presentation
+            // frame so it stays glued to the moving window top
+            // instead of jumping to the final top at toggle start.
+            CGRect viewFrame = vc.view.frame;
+            if (inToggle) {
+                CALayer *presentation = vc.view.layer.presentationLayer;
+                if (presentation) viewFrame = presentation.frame;
+            }
+            CGFloat windowTop = viewFrame.origin.y;
+            CGFloat windowMidX = viewFrame.origin.x + viewFrame.size.width / 2;
             CGFloat centerY = windowTop - 6;
             if (centerY < 22) centerY = 22;
             CGPoint wantCenter = CGPointMake(windowMidX, centerY);
@@ -1156,10 +1171,11 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
     // 0.25s ease-out, drag bar fades with it), then call orig in
     // the completion. Maximized closes keep the old immediate path
     // (unchanged). Re-entrant taps during the animation are ignored
-    // (the first completion will close it). forceSmall counts as
-    // small here (closing mid-shrink still animates out).
-    BOOL forceSmall = [objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue];
-    BOOL isSmall = !vc.isMaximized || forceSmall;
+    // (the first completion will close it). Closing during a toggle
+    // animation (forced rounded) counts as small here.
+    NSNumber *toggleTime = objc_getAssociatedObject(vc, &kMultitaskFloatToggleTimeKey);
+    BOOL inToggle = toggleTime && ([[NSDate date] timeIntervalSince1970] - [toggleTime doubleValue] < 0.4);
+    BOOL isSmall = !vc.isMaximized || inToggle;
     BOOL alreadyClosing = [objc_getAssociatedObject(vc, &kMultitaskFloatClosingKey) boolValue];
     if (isSmall && vc.view.window && !alreadyClosing) {
         objc_setAssociatedObject(vc, &kMultitaskFloatClosingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1210,12 +1226,10 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
 static void MultitaskFloatStartDisplayLink(DecoratedAppSceneViewController *vc);
 
 static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
-    // v56: capture the pre-toggle state — if this tap restores to a
-    // small window, force small chrome through the animation (see
-    // SyncWindowChrome); if it maximizes, clear any stale force flag.
-    BOOL wasMaximized = [(DecoratedAppSceneViewController *)self isMaximized];
+    // v58: stamp the toggle time (see SyncWindowChrome) — rounded
+    // chrome is forced for 0.4s after any toggle, both directions.
+    objc_setAssociatedObject(self, &kMultitaskFloatToggleTimeKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (origMaximizeWindow) origMaximizeWindow(self, _cmd);
-    objc_setAssociatedObject(self, &kMultitaskFloatForceSmallKey, @(wasMaximized), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
     // Delayed chrome sync: the immediate ApplyLayout can run with a
     // stale isMaximized or intermediate bounds (the toggle animates
@@ -1242,10 +1256,8 @@ static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
 }
 
 static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
-    // v56: minimize always targets a small window — force small chrome
-    // through the animation (see SyncWindowChrome). Overwritten on
-    // every later toggle, so no explicit clear is needed.
-    objc_setAssociatedObject(self, &kMultitaskFloatForceSmallKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // v58: stamp the toggle time (see SyncWindowChrome).
+    objc_setAssociatedObject(self, &kMultitaskFloatToggleTimeKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (origMinimizeWindow) origMinimizeWindow(self, _cmd);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
     // Same delayed chrome sync as maximize (see above).
@@ -1642,13 +1654,16 @@ static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
             objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             return;
         }
-        // v56: don't skip ticks during a shrink animation — the flag
-        // is still maximized then, but the forced-small chrome must
-        // track the shrinking bounds every frame.
+        // v58: don't stop ticks during a toggle animation — the flag
+        // can still be maximized then, but the forced-rounded chrome
+        // must track the animating bounds every frame (supersedes
+        // v56's forceSmall flag, now a 0.4s timestamp window).
         // v57 perf: when maximized, stop the link outright instead of
         // waking 60x/sec for 5s just to return early — restore
         // restarts it via MaximizeWindow (v53), so nothing is lost.
-        if (vc.isMaximized && ![objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue]) {
+        NSNumber *toggleTime = objc_getAssociatedObject(vc, &kMultitaskFloatToggleTimeKey);
+        BOOL inToggle = toggleTime && (now - [toggleTime doubleValue] < 0.4);
+        if (vc.isMaximized && !inToggle) {
             ((void (*)(id, SEL))objc_msgSend)(link, @selector(invalidate));
             objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
