@@ -58,6 +58,21 @@
 // itself stays: it is the safety net that keeps the docked window
 // from running to the right edge (v77).
 
+// v80: haptics everywhere, one tap per moment, style per action
+// (the user asked for finer haptics than the single open tap in
+// v78). Map — open pop start: medium (v78, unchanged); close
+// start: light; maximize (small -> fullscreen): medium, restore
+// to small window: light; minimize (unpinned): light; dock
+// landing (window becomes the blue tab): medium; restore from
+// dock (tap the tab): medium; drag a small window: light on grab,
+// light on release; drag the floating pill: light on grab, medium
+// when it snaps to an edge; double-tap drag bar: medium to pin,
+// light to unpin. One pulse per moment, never a buzz — the style
+// is the difference, not the count. UIImpactFeedbackGenerator
+// follows the system "System Haptics" switch, so a user who turns
+// haptics off feels nothing; it is a no-op without a Taptic
+// Engine, and needs no entitlement or new framework.
+
 // LiveContainer's multitasking virtual windows are DecoratedAppSceneViewController:
 // a vertical stack of [44pt UINavigationBar, content]. The bar holds the app
 // title (with its title menu, the "AssppPro v" control) and three
@@ -657,6 +672,16 @@ static void MultitaskFloatSyncPill(DecoratedAppSceneViewController *vc) {
     MultitaskFloatApplyPillBorder(pill, vc.view);
 }
 
+// v80: one haptic tap in the given style. A fresh generator per
+// tap is the standard pattern for single, unrelated taps (each
+// call site is its own moment); prepare + impact back to back is
+// idiomatic and harmless.
+static void MultitaskFloatHaptic(UIImpactFeedbackStyle style) {
+    UIImpactFeedbackGenerator *generator = [[UIImpactFeedbackGenerator alloc] initWithStyle:style];
+    [generator prepare];
+    [generator impactOccurred];
+}
+
 static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sender) {
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
     UIView *pill = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
@@ -678,7 +703,10 @@ static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sen
         CGFloat floorY = vc.view.window.safeAreaInsets.top - vc.view.frame.origin.y;
         if (floorY > allowed.origin.y) minCenterY = fmax(minCenterY, floorY + hh + 4);
     }
-    if (sender.state == UIGestureRecognizerStateChanged) {
+    if (sender.state == UIGestureRecognizerStateBegan) {
+        // v80: grab — one light tap when the pill drag starts.
+        MultitaskFloatHaptic(UIImpactFeedbackStyleLight);
+    } else if (sender.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [sender translationInView:vc.view];
         [sender setTranslation:CGPointZero inView:vc.view];
         CGPoint c = CGPointMake(pill.center.x + t.x, pill.center.y + t.y);
@@ -686,6 +714,9 @@ static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sen
         c.y = fmax(minCenterY, fmin(c.y, allowed.origin.y + allowed.size.height - hh));
         pill.center = c;
     } else if (sender.state == UIGestureRecognizerStateEnded || sender.state == UIGestureRecognizerStateCancelled) {
+        // v80: edge snap — one medium tap as the pill docks to the
+        // nearest left/right edge on release.
+        MultitaskFloatHaptic(UIImpactFeedbackStyleMedium);
         // Dock to the nearest left/right edge on release, keep the height.
         CGFloat midX = allowed.origin.x + allowed.size.width / 2;
         CGFloat targetX = (pill.center.x < midX) ? (allowed.origin.x + hw + 8) : (allowed.origin.x + allowed.size.width - hw - 8);
@@ -1375,6 +1406,8 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
     // completion closes the window. Previously it fell through to
     // the immediate path below and cut the fade short.
     if (alreadyClosing) return;
+    // v80: close tap — one light tap as the window starts to go.
+    MultitaskFloatHaptic(UIImpactFeedbackStyleLight);
     if (isSmall && vc.view.window && !alreadyClosing) {
         objc_setAssociatedObject(vc, &kMultitaskFloatClosingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // Stop the per-frame link now (window is going away; ticks
@@ -1449,6 +1482,10 @@ static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
     // the host maximize it (e.g. when another app opens) would move
     // it out of the dock and strand it. Restore via the tab instead.
     if ([objc_getAssociatedObject(self, &kMultitaskFloatDockedKey) boolValue]) return;
+    // v80: toggle tap — medium growing to fullscreen, light
+    // shrinking back to a small window. isMaximized is still the
+    // pre-toggle state here, so it reads as the direction.
+    MultitaskFloatHaptic(((DecoratedAppSceneViewController *)self).isMaximized ? UIImpactFeedbackStyleLight : UIImpactFeedbackStyleMedium);
     // v58: stamp the toggle time (see SyncWindowChrome) — rounded
     // chrome is forced for 0.4s after any toggle, both directions.
     objc_setAssociatedObject(self, &kMultitaskFloatToggleTimeKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1491,6 +1528,10 @@ static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
     // hidden at the left edge; the host's minimize would move it to
     // its own (right-edge) minimized slot and fight the dock.
     if ([objc_getAssociatedObject(self, &kMultitaskFloatDockedKey) boolValue]) return;
+    // v80: minimize tap — one light tap as the window shrinks away.
+    // (A pinned window never reaches here: the pill docks it
+    // instead, and the dock landing taps at its own moment.)
+    MultitaskFloatHaptic(UIImpactFeedbackStyleLight);
     // v58: stamp the toggle time (see SyncWindowChrome).
     objc_setAssociatedObject(self, &kMultitaskFloatToggleTimeKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (origMinimizeWindow) origMinimizeWindow(self, _cmd);
@@ -1808,9 +1849,8 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     // felt growing out of the tapped icon, not just seen. Fired
     // here, immediately before the spring starts, so the tap and
     // the first frame of the pop coincide. One pulse only.
-    UIImpactFeedbackGenerator *openHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [openHaptic prepare];
-    [openHaptic impactOccurred];
+    // v80: now via the shared helper (same tap as before).
+    MultitaskFloatHaptic(UIImpactFeedbackStyleMedium);
     [UIView animateWithDuration:0.6 delay:0 usingSpringWithDamping:0.77 initialSpringVelocity:0 options:0 animations:^{
         view.alpha = 1;
         view.transform = CGAffineTransformIdentity;
@@ -2246,6 +2286,11 @@ static void MultitaskFloatDragWindow(id self, SEL _cmd, UIPanGestureRecognizer *
         }];
         // Restore completed synchronously, so the icon flips now.
         MultitaskFloatSyncPill(vc);
+        // v80: the restore itself already tapped (light, in
+        // MaximizeWindow) — no second tap for the grab.
+    } else if (sender.state == UIGestureRecognizerStateBegan) {
+        // v80: grab — one light tap when the window drag starts.
+        MultitaskFloatHaptic(UIImpactFeedbackStyleLight);
     }
     [vc moveWindow:sender];
     // v45: the drag bar is in the superview, so it no longer rides
@@ -2261,6 +2306,10 @@ static void MultitaskFloatDragWindow(id self, SEL _cmd, UIPanGestureRecognizer *
             if (centerY < 22) centerY = 22;
             dragBar.center = CGPointMake(windowMidX, centerY);
         }
+    }
+    // v80: release — one light tap when the window drag ends.
+    if (sender.state == UIGestureRecognizerStateEnded || sender.state == UIGestureRecognizerStateCancelled) {
+        MultitaskFloatHaptic(UIImpactFeedbackStyleLight);
     }
     // v40: dragging any window can reorder windows, so re-assert
     // pinned windows on top after the move (idempotent).
@@ -2290,6 +2339,8 @@ static void MultitaskFloatTogglePin(id self, SEL _cmd, UITapGestureRecognizer *s
         [MultitaskFloatPinnedWindows removeObject:vc];
     }
     MultitaskFloatSyncPinCapsule(vc);
+    // v80: pin tap — medium locking in, light unlocking.
+    MultitaskFloatHaptic(pinned ? UIImpactFeedbackStyleMedium : UIImpactFeedbackStyleLight);
 }
 
 // v60: edge-dock for pinned windows. Tapping yellow minimize on a
@@ -2524,6 +2575,9 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         vc.view.hidden = YES;
         if (dragBar) dragBar.hidden = YES;
         dockWindow.hidden = NO;
+        // v80: dock landing — one medium tap as the window becomes
+        // the blue tab at the left edge.
+        MultitaskFloatHaptic(UIImpactFeedbackStyleMedium);
         objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
         objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v77
     }];
@@ -2537,6 +2591,9 @@ static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
     if (![objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
     objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
     objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingStartKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v77: stale-flag detection
+    // v80: restore tap — one medium tap as the window slides back
+    // from the blue tab.
+    MultitaskFloatHaptic(UIImpactFeedbackStyleMedium);
     // Hide the dock window first: the window slides back from the
     // edge as the tab vanishes, so the tab reads as becoming the
     // window. Hiding + clearing the window also releases the tab
