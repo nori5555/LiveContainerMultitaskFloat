@@ -2076,27 +2076,27 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     CGRect windowFrameInWindow = [parent convertRect:vc.view.frame toView:window];
     CGFloat centerYInWindow = windowFrameInWindow.origin.y + windowFrameInWindow.size.height / 2;
     CGFloat tabYInWindow = centerYInWindow;
-    if (tabYInWindow < 50) tabYInWindow = 50;
-    if (tabYInWindow > screenSize.height - 50) tabYInWindow = screenSize.height - 50;
+    if (tabYInWindow < 70) tabYInWindow = 70;
+    if (tabYInWindow > screenSize.height - 70) tabYInWindow = screenSize.height - 70;
     CGFloat tabXInWindow = 10; // v61: left edge only
-    // Edge tab: 44x80 hit area (tappable despite the small visual),
-    // 6x48 blue vertical capsule centered in it (the drag bar capsule
+    // v65: bigger edge tab: 64x120 hit area (tappable despite the small visual),
+    // 10x80 blue vertical capsule centered in it (the drag bar capsule
     // rotated 90 degrees: same blue = pinned language, same small-bar
     // reading). Created once per dock; removed on restore/close.
     // v61: the tab lives in its own UIWindow (alert level, frame =
     // the tab rect), not in the window's superview — so it stays
     // visible + tappable above ANY app (a maximized guest, another
     // small window, the list), not just above its own window. The
-    // window frame is only 44x80, so touches outside the tab still
+    // window frame is only 64x120, so touches outside the tab still
     // reach the app below; the tab's transparent margins are the
     // tap area, same as before.
     UIView *tab = objc_getAssociatedObject(vc, &kMultitaskFloatDockTabKey);
     if (!tab) {
-        tab = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 44, 80)];
+        tab = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 64, 120)];
         tab.backgroundColor = [UIColor clearColor];
-        UIView *capsule = [[UIView alloc] initWithFrame:CGRectMake(19, 16, 6, 48)];
+        UIView *capsule = [[UIView alloc] initWithFrame:CGRectMake(27, 20, 10, 80)];
         capsule.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.9];
-        capsule.layer.cornerRadius = 3;
+        capsule.layer.cornerRadius = 5;
         capsule.layer.masksToBounds = YES;
         [tab addSubview:capsule];
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:vc action:@selector(MultitaskFloatDockTabTapped:)];
@@ -2109,7 +2109,7 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     // the window has slid away, so the window appears to become the tab.
     UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
     if (!dockWindow) {
-        dockWindow = [[UIWindow alloc] initWithFrame:CGRectMake(tabXInWindow - 22, tabYInWindow - 40, 44, 80)];
+        dockWindow = [[UIWindow alloc] initWithFrame:CGRectMake(tabXInWindow - 32, tabYInWindow - 60, 64, 120)];
         // v62: a UIWindow without a scene never renders (iOS 13+) —
         // that is why the v61 tab never appeared. Attach the host
         // window's scene so the tab actually shows above any app.
@@ -2120,7 +2120,7 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         [dockWindow addSubview:tab];
         objc_setAssociatedObject(vc, &kMultitaskFloatDockWindowKey, dockWindow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
-        dockWindow.frame = CGRectMake(tabXInWindow - 22, tabYInWindow - 40, 44, 80);
+        dockWindow.frame = CGRectMake(tabXInWindow - 32, tabYInWindow - 60, 64, 120);
         dockWindow.windowScene = window.windowScene;
         dockWindow.hidden = YES;
         if (tab.superview != dockWindow) [dockWindow addSubview:tab];
