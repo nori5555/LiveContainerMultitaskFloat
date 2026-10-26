@@ -10,6 +10,32 @@
 // experiment is fully reverted: OpenAnimation.swift is deleted and
 // the Makefile no longer lists SWIFT_FILES.
 
+// v77: docked window runs to the right edge, untappable (user
+// 2026-10-27 03:58 screenshot). Repro: double-tap the drag bar to
+// pin, tap yellow minimize to dock to the left edge, then open
+// another app — the docked window ends up as a sliver on the right
+// edge with no left tab to restore it. Root cause, reviewed in
+// code: the dock state was not owned by anyone once another app
+// opened. The host re-parents / re-appears windows when a new app
+// opens, and three of our own handlers then undid the dock: (1)
+// viewDidAppear's v66 block dropped the dock state and reset the
+// view to identity/visible, then AnimateOpen popped it at whatever
+// frame the host had moved it to (its right-edge minimized slot);
+// (2) viewDidDisappear dropped the tab + docked flag and reset the
+// view to identity/visible; (3) a host minimize/maximize on the
+// docked window moved it outright. Fix, defense in depth: the dock
+// is now re-asserted (view hidden + slid left, tab window back at
+// the left edge) whenever any window appears, lays out, or the
+// watchdog ticks; appear/disappear never clear dock state while
+// docked (disappear only drops the tab 10s later if the view is
+// truly detached with no window and no superview); host
+// minimize/maximize on a docked window is ignored; the frame the
+// window had when it docked is saved and restored on restore, so
+// a host-moved frame can never strand it; and SyncWindowChrome
+// pulls any non-docked window whose frame is mostly off-screen
+// back on-screen, so an already-stranded window recovers on the
+// next layout/watchdog tick instead of staying stuck at the edge.
+
 // LiveContainer's multitasking virtual windows are DecoratedAppSceneViewController:
 // a vertical stack of [44pt UINavigationBar, content]. The bar holds the app
 // title (with its title menu, the "AssppPro v" control) and three
@@ -360,6 +386,8 @@ static const char kMultitaskFloatDockedKey = 0;
 static const char kMultitaskFloatDockTabKey = 0;
 static const char kMultitaskFloatDockWindowKey = 0; // v61: separate window so the tab stays above any app
 static const char kMultitaskFloatDockAnimatingKey = 0; // v66: dock/restore animation in flight
+static const char kMultitaskFloatDockAnimatingStartKey = 0; // v77: dock/restore animation start time, for stale-flag detection
+static const char kMultitaskFloatDockSavedFrameKey = 0; // v77: the window frame at dock time, restored on restore
 static const char kMultitaskFloatWatchdogKey = 0; // v71: permanent chrome watchdog running
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
@@ -370,8 +398,12 @@ static NSHashTable *MultitaskFloatPinnedWindows = nil;
 // Docked window (v63): only ONE window may be docked at a time. A
 // single weak ref (not a set) — it zeroes out on its own if the
 // window goes away without cleanup, and it is cleared explicitly on
-// restore/close/disappear. Set on dock, checked before docking
-// another window (prompt + refuse if one is already docked).
+// restore/close. v77: disappear does NOT clear it while docked (the
+// dock must survive the host re-parenting windows when another app
+// opens); a truly detached docked window loses its tab 10s later
+// via the delayed check in viewDidDisappear. Set on dock, checked
+// before docking another window (prompt + refuse if one is already
+// docked).
 static __weak DecoratedAppSceneViewController *MultitaskFloatDockedVC = nil;
 
 // Forward declaration: defined after InitImpl, used by it.
@@ -647,6 +679,11 @@ static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sen
 // declare fails the build).
 static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc);
 static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc);
+// v77: re-assert a docked window (view hidden + slid left, tab back
+// at the left edge). Defined with the dock helpers below; called
+// from BringPinnedToFront, viewDidAppear and the watchdog, so it is
+// declared here too.
+static void MultitaskFloatReassertDock(DecoratedAppSceneViewController *vc);
 
 static void MultitaskFloatPillButton(id self, SEL _cmd, UIButton *sender) {
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
@@ -815,7 +852,14 @@ static void MultitaskFloatBringPinnedToFront(void) {
         // v60: skip edge-docked windows — the window is hidden and
         // its edge tab is the visible UI; bringing a hidden window
         // forward is pointless and could reorder its tab.
-        if ([objc_getAssociatedObject(pinnedVC, &kMultitaskFloatDockedKey) boolValue]) continue;
+        // v77: instead, re-assert the dock — any layout pass (a new
+        // app opening re-parents windows) is exactly when the host
+        // may have moved the docked window or its tab, so this is
+        // the moment to put both back at the left edge.
+        if ([objc_getAssociatedObject(pinnedVC, &kMultitaskFloatDockedKey) boolValue]) {
+            MultitaskFloatReassertDock(pinnedVC);
+            continue;
+        }
         if (pinnedVC.view && pinnedVC.view.superview) {
             [pinnedVC.view.superview bringSubviewToFront:pinnedVC.view];
             // v45: bringing the window forward puts it above its
@@ -904,6 +948,32 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
             objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             animatingOpen = NO;
+        }
+    }
+    // v77: stranded-window safety net. A non-docked window whose
+    // model frame is mostly off-screen (less than 100pt visible on
+    // either side — e.g. the host moved a docked window to its
+    // right-edge slot and the dock state was lost) can never be
+    // grabbed or tapped. Pull it back on-screen, centered. Docked
+    // windows never reach here (early return above), and docking
+    // moves the window with a transform, not the frame, so this
+    // cannot fight a dock. Skipped while animating / toggling /
+    // closing or with a non-identity transform, so no animation is
+    // ever interrupted mid-flight.
+    if (vc.view.window && CGAffineTransformIsIdentity(vc.view.transform) && !animatingOpen && ![objc_getAssociatedObject(vc, &kMultitaskFloatClosingKey) boolValue]) {
+        NSNumber *toggleTimeForClamp = objc_getAssociatedObject(vc, &kMultitaskFloatToggleTimeKey);
+        BOOL inToggleForClamp = toggleTimeForClamp && ([[NSDate date] timeIntervalSince1970] - [toggleTimeForClamp doubleValue] < 0.4);
+        if (!inToggleForClamp) {
+            CGSize screenSizeForClamp = vc.view.window.bounds.size;
+            CGRect frameForClamp = vc.view.frame;
+            if (frameForClamp.size.width > 0 && frameForClamp.size.height > 0 && (frameForClamp.origin.x > screenSizeForClamp.width - 100 || frameForClamp.origin.x + frameForClamp.size.width < 100)) {
+                CGFloat clampedW = fmin(frameForClamp.size.width, screenSizeForClamp.width);
+                CGFloat clampedH = fmin(frameForClamp.size.height, screenSizeForClamp.height);
+                CGFloat clampedY = frameForClamp.origin.y;
+                if (clampedY < 0) clampedY = 0;
+                if (clampedY + clampedH > screenSizeForClamp.height) clampedY = fmax(0, screenSizeForClamp.height - clampedH);
+                vc.view.frame = CGRectMake((screenSizeForClamp.width - clampedW) / 2, clampedY, clampedW, clampedH);
+            }
         }
     }
     // v58: force rounded chrome during ANY toggle animation
@@ -1352,6 +1422,11 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
 static void MultitaskFloatStartDisplayLink(DecoratedAppSceneViewController *vc);
 
 static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
+    // v77: ignore a maximize on a docked window — the window is
+    // hidden at the left edge and its tab is the only UI; letting
+    // the host maximize it (e.g. when another app opens) would move
+    // it out of the dock and strand it. Restore via the tab instead.
+    if ([objc_getAssociatedObject(self, &kMultitaskFloatDockedKey) boolValue]) return;
     // v58: stamp the toggle time (see SyncWindowChrome) — rounded
     // chrome is forced for 0.4s after any toggle, both directions.
     objc_setAssociatedObject(self, &kMultitaskFloatToggleTimeKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1390,6 +1465,10 @@ static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
 }
 
 static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
+    // v77: ignore a minimize on a docked window — it is already
+    // hidden at the left edge; the host's minimize would move it to
+    // its own (right-edge) minimized slot and fight the dock.
+    if ([objc_getAssociatedObject(self, &kMultitaskFloatDockedKey) boolValue]) return;
     // v58: stamp the toggle time (see SyncWindowChrome).
     objc_setAssociatedObject(self, &kMultitaskFloatToggleTimeKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (origMinimizeWindow) origMinimizeWindow(self, _cmd);
@@ -1757,32 +1836,54 @@ static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
         [dragBar removeFromSuperview];
         objc_setAssociatedObject(self, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    // v60: also drop the edge-dock tab + docked flag, so a docked
-    // window that goes away leaves no lingering tab.
-    // v61: also hide + drop the dock window (the tab lives in it now).
-    // v66: if it was docked when it went away (host terminate path,
-    // not tab-restore), also reset the view itself — otherwise the
-    // off-screen-left transform + hidden + alpha 0 survive for a
-    // later layout-only reappear, and the small window never shows.
-    // Disappearing means it is already off-screen, so resetting
-    // here cannot flash anything.
+    // v77: a docked window disappearing must NOT lose its dock.
+    // viewDidDisappear also fires when the host re-parents windows
+    // (e.g. another app opens) — the old code dropped the tab +
+    // docked flag here and reset the view to identity/visible, so
+    // the window came back at whatever frame the host had moved it
+    // to (its right-edge minimized slot) with no tab to restore it:
+    // the reported right-edge sliver. While docked, keep the tab,
+    // the dock window, the docked flag and the dock slot, and leave
+    // the view hidden/off-screen-left exactly as DockToEdge left
+    // it. The v66 terminate case (a docked window killed via a host
+    // path, never to return) is handled by a delayed check below:
+    // if the view is still detached — no window and no superview —
+    // 10s later, the app is really gone and the tab is dropped then.
+    // A re-parented window is back in a window long before that,
+    // so its tab survives.
     BOOL wasDocked = [objc_getAssociatedObject(self, &kMultitaskFloatDockedKey) boolValue];
-    UIWindow *dockWindow = objc_getAssociatedObject(self, &kMultitaskFloatDockWindowKey);
-    if (dockWindow) dockWindow.hidden = YES;
-    objc_setAssociatedObject(self, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    UIView *dockTab = objc_getAssociatedObject(self, &kMultitaskFloatDockTabKey);
-    if (dockTab) [dockTab removeFromSuperview];
-    objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(self, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(self, &kMultitaskFloatDockAnimatingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (MultitaskFloatDockedVC == self) MultitaskFloatDockedVC = nil; // v63: dock slot frees on disappear
     if (wasDocked) {
-        UIView *goneView = ((DecoratedAppSceneViewController *)self).view;
-        if (goneView) {
-            goneView.transform = CGAffineTransformIdentity;
-            goneView.alpha = 1;
-            goneView.hidden = NO;
-        }
+        __weak DecoratedAppSceneViewController *weakGoneVC = (DecoratedAppSceneViewController *)self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            DecoratedAppSceneViewController *strongGoneVC = weakGoneVC;
+            if (!strongGoneVC) return;
+            if (![objc_getAssociatedObject(strongGoneVC, &kMultitaskFloatDockedKey) boolValue]) return;
+            UIView *goneView = strongGoneVC.view;
+            if (goneView && !goneView.window && !goneView.superview) {
+                UIWindow *goneDockWindow = objc_getAssociatedObject(strongGoneVC, &kMultitaskFloatDockWindowKey);
+                if (goneDockWindow) goneDockWindow.hidden = YES;
+                objc_setAssociatedObject(strongGoneVC, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                UIView *goneDockTab = objc_getAssociatedObject(strongGoneVC, &kMultitaskFloatDockTabKey);
+                if (goneDockTab) [goneDockTab removeFromSuperview];
+                objc_setAssociatedObject(strongGoneVC, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(strongGoneVC, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(strongGoneVC, &kMultitaskFloatDockAnimatingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (MultitaskFloatDockedVC == strongGoneVC) MultitaskFloatDockedVC = nil;
+            }
+        });
+    } else {
+        // v60: drop the edge-dock tab + docked flag, so a docked
+        // window that goes away leaves no lingering tab.
+        // v61: also hide + drop the dock window (the tab lives in it now).
+        UIWindow *dockWindow = objc_getAssociatedObject(self, &kMultitaskFloatDockWindowKey);
+        if (dockWindow) dockWindow.hidden = YES;
+        objc_setAssociatedObject(self, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UIView *dockTab = objc_getAssociatedObject(self, &kMultitaskFloatDockTabKey);
+        if (dockTab) [dockTab removeFromSuperview];
+        objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, &kMultitaskFloatDockAnimatingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (MultitaskFloatDockedVC == self) MultitaskFloatDockedVC = nil; // v63: dock slot frees on disappear
     }
     // v51: stop the per-frame link when the window goes away, so a
     // closed window never keeps ticking (the tick also stops itself
@@ -1870,6 +1971,11 @@ static void MultitaskFloatChromeWatchdog(DecoratedAppSceneViewController *vc) {
         return;
     }
     MultitaskFloatSyncWindowChrome(vc);
+    // v77: re-assert the docked window (if any) on every tick —
+    // opening another app is when the host re-parents windows, so
+    // the dock must be re-checked continuously, not only on the
+    // docked window's own layout passes.
+    if (MultitaskFloatDockedVC) MultitaskFloatReassertDock(MultitaskFloatDockedVC);
     __weak DecoratedAppSceneViewController *weakVC = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         DecoratedAppSceneViewController *strongVC = weakVC;
@@ -1880,26 +1986,33 @@ static void MultitaskFloatChromeWatchdog(DecoratedAppSceneViewController *vc) {
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
-    // v66: a window reappearing after its app was terminated must
-    // not keep dock leftovers — a docked window killed via a host
-    // path (not tab-restore, not red close) kept hidden=YES,
-    // transform off-screen-left and alpha 0, so it reappeared
-    // invisible. Appearing means it must be shown, so drop the
-    // dock state and reset the view before the open pop.
+    // v77: a docked window re-appearing must STAY docked. The v66
+    // block dropped the dock state here and reset the view to
+    // identity/visible, then AnimateOpen popped it at whatever frame
+    // the host had moved it to — that is the reported bug: opening
+    // another app re-fires appear on the docked window, the host
+    // has moved it to its right-edge minimized slot, and it comes
+    // back there with no tab. Re-assert the dock instead and return
+    // early: no open pop (it would undo the dock transform), no
+    // layout, no timers — the tab is the window's UI until tapped.
+    // A window reappearing after its app was terminated (the v66
+    // case) now stays docked with a visible, tappable tab instead
+    // of reappearing invisible, which is the recoverable outcome.
     if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue] || [objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) {
-        UIWindow *oldDockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
-        if (oldDockWindow) oldDockWindow.hidden = YES;
-        objc_setAssociatedObject(vc, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        UIView *oldDockTab = objc_getAssociatedObject(vc, &kMultitaskFloatDockTabKey);
-        if (oldDockTab) [oldDockTab removeFromSuperview];
-        objc_setAssociatedObject(vc, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (MultitaskFloatDockedVC == vc) MultitaskFloatDockedVC = nil;
-        vc.view.hidden = NO;
-        vc.view.transform = CGAffineTransformIdentity;
-        vc.view.alpha = 1;
+        MultitaskFloatReassertDock(vc);
+        // Keep the watchdog chain alive for this window, so the
+        // dock keeps being re-asserted every 5s even if no other
+        // window is open to trigger it.
+        if (![objc_getAssociatedObject(vc, &kMultitaskFloatWatchdogKey) boolValue]) {
+            objc_setAssociatedObject(vc, &kMultitaskFloatWatchdogKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            MultitaskFloatChromeWatchdog(vc);
+        }
+        return;
     }
+    // v77: this window is not docked, but another one may be — a
+    // new app opening is exactly when the host re-parents windows,
+    // so re-assert that dock here too, before this window's pop.
+    if (MultitaskFloatDockedVC && MultitaskFloatDockedVC != vc) MultitaskFloatReassertDock(MultitaskFloatDockedVC);
     MultitaskFloatAnimateOpen(vc);
     MultitaskFloatApplyLayout(vc);
     // Delayed full recompute: the user's diagnostics (v17) show that
@@ -2160,38 +2273,30 @@ static void MultitaskFloatTogglePin(id self, SEL _cmd, UITapGestureRecognizer *s
 // maximized window restores maximized and a docked small window
 // restores small. Pinned stays pinned across dock/restore (docking is
 // not unpinning).
-static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
-    if (!vc.view || !vc.view.window || !vc.view.superview) return;
-    // v66: a dock already sliding must not be re-entered — repeated
-    // taps in the slide window stacked a second dock/minimize on
-    // top of the first and left the window at a side position.
-    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) return;
-    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
-    // v63: only one docked window — if a DIFFERENT window is already
-    // docked, prompt and refuse this dock (leave this window as it
-    // was, keep the docked one). Same-window re-dock is already
-    // blocked above (docked flag), and its pill is hidden anyway.
-    if (MultitaskFloatDockedVC && MultitaskFloatDockedVC != vc) {
-        if (!vc.presentedViewController) {
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"只能吸附一个窗口" message:@"已经有一个窗口吸附在左边了，先恢复它再吸附这个。" preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
-            [vc presentViewController:alert animated:YES completion:nil];
-        }
-        return;
+// v77: the tab's Y in window (screen) coordinates, from a frame
+// given in superview coordinates. vc.view.center is in superview
+// coords, so convert — never assume superview == window. Clamped
+// so the tab never sits under the status bar or off the bottom.
+static CGFloat MultitaskFloatDockTabY(DecoratedAppSceneViewController *vc, CGRect frameInSuperview, UIWindow *window, CGSize screenSize) {
+    CGFloat centerY;
+    if (window && vc.view.superview) {
+        CGRect frameInWindow = [vc.view.superview convertRect:frameInSuperview toView:window];
+        centerY = frameInWindow.origin.y + frameInWindow.size.height / 2;
+    } else {
+        centerY = frameInSuperview.origin.y + frameInSuperview.size.height / 2;
     }
-    UIView *parent = vc.view.superview;
-    UIWindow *window = vc.view.window;
-    CGSize screenSize = window.bounds.size;
-    // Window center Y in window (screen) coordinates, for the tab's
-    // Y. vc.view.center is in superview coords, so convert — never
-    // assume superview == window. (v61: left edge only — the window
-    // X is no longer needed, the tab is always at the left edge.)
-    CGRect windowFrameInWindow = [parent convertRect:vc.view.frame toView:window];
-    CGFloat centerYInWindow = windowFrameInWindow.origin.y + windowFrameInWindow.size.height / 2;
-    CGFloat tabYInWindow = centerYInWindow;
-    if (tabYInWindow < 70) tabYInWindow = 70;
-    if (tabYInWindow > screenSize.height - 70) tabYInWindow = screenSize.height - 70;
-    CGFloat tabXInWindow = 10; // v61: left edge only
+    if (centerY < 70) centerY = 70;
+    if (centerY > screenSize.height - 70) centerY = screenSize.height - 70;
+    return centerY;
+}
+
+// v77: create the edge tab + its window if missing, and (re)place
+// the window at the left edge. Shared by DockToEdge and
+// ReassertDock, so a tab dropped by an old handler (or a window
+// the host moved) is rebuilt at the left edge instead of staying
+// lost. Leaves the dock window hidden; the caller shows it when
+// the window has slid away (DockToEdge) or at once (ReassertDock).
+static void MultitaskFloatEnsureDockTabWindow(DecoratedAppSceneViewController *vc, CGFloat tabYInWindow, UIWindow *window) {
     // v65: bigger edge tab: 64x120 hit area (tappable despite the small visual),
     // 10x80 blue vertical capsule centered in it (the drag bar capsule
     // rotated 90 degrees: same blue = pinned language, same small-bar
@@ -2218,15 +2323,16 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     }
     // Position the dock window at the edge (screen coords: the
     // window is full-screen at origin, so screen == window coords;
-    // no superview conversion needed). Keep the window hidden until
-    // the window has slid away, so the window appears to become the tab.
+    // no superview conversion needed). v61: left edge only — the tab
+    // is always at the left edge.
+    CGFloat tabXInWindow = 10; // v61: left edge only
     UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
     if (!dockWindow) {
         dockWindow = [[UIWindow alloc] initWithFrame:CGRectMake(tabXInWindow - 32, tabYInWindow - 60, 64, 120)];
         // v62: a UIWindow without a scene never renders (iOS 13+) —
         // that is why the v61 tab never appeared. Attach the host
         // window's scene so the tab actually shows above any app.
-        dockWindow.windowScene = window.windowScene;
+        if (window) dockWindow.windowScene = window.windowScene;
         dockWindow.windowLevel = UIWindowLevelAlert;
         dockWindow.backgroundColor = [UIColor clearColor];
         dockWindow.hidden = YES;
@@ -2234,13 +2340,123 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         objc_setAssociatedObject(vc, &kMultitaskFloatDockWindowKey, dockWindow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
         dockWindow.frame = CGRectMake(tabXInWindow - 32, tabYInWindow - 60, 64, 120);
-        dockWindow.windowScene = window.windowScene;
+        if (window) dockWindow.windowScene = window.windowScene;
         dockWindow.hidden = YES;
         if (tab.superview != dockWindow) [dockWindow addSubview:tab];
     }
+}
+
+// v77: re-assert a docked window. The host re-parents / re-appears
+// windows when another app opens, and can move the docked window
+// (to its right-edge minimized slot), unhide it, or reset its
+// transform — any of which strands it on the right with no tab.
+// This puts it back: view hidden + slid a full screen width left +
+// faded, at the frame it had when it docked, and the tab window
+// back at the left edge, visible. Idempotent and cheap when
+// nothing moved, so it is safe to call from every layout pass,
+// appear, and watchdog tick. Skipped mid-slide (the animation's
+// own completion lands the dock); a slide flag older than 2s is
+// stale (its completion never ran) and is cleared first, so a lost
+// completion can never wedge the dock forever.
+static void MultitaskFloatReassertDock(DecoratedAppSceneViewController *vc) {
+    if (!vc || !vc.view) return;
+    if (![objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) {
+        NSNumber *dockAnimStart = objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingStartKey);
+        if (dockAnimStart && ([[NSDate date] timeIntervalSince1970] - [dockAnimStart doubleValue] > 2.0)) {
+            objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } else {
+            return;
+        }
+    }
+    UIWindow *window = vc.view.window;
+    CGSize screenSize = window ? window.bounds.size : [UIScreen mainScreen].bounds.size;
+    // The frame the window had when it docked (superview coords);
+    // fall back to the current frame if none was saved.
+    NSValue *savedValue = objc_getAssociatedObject(vc, &kMultitaskFloatDockSavedFrameKey);
+    CGRect savedFrame = savedValue ? [savedValue CGRectValue] : vc.view.frame;
+    if (savedFrame.size.width <= 0 || savedFrame.size.height <= 0) savedFrame = vc.view.frame;
+    CGAffineTransform dockTransform = CGAffineTransformMakeTranslation(-screenSize.width, 0);
+    // center/bounds are transform-independent, so they tell whether
+    // the host moved the model geometry even while the dock slide
+    // transform is still applied (frame alone cannot — it is the
+    // transformed bounding box).
+    CGPoint savedCenter = CGPointMake(savedFrame.origin.x + savedFrame.size.width / 2, savedFrame.origin.y + savedFrame.size.height / 2);
+    BOOL viewOK = vc.view.hidden && vc.view.alpha == 0 && CGAffineTransformEqualToTransform(vc.view.transform, dockTransform) && CGSizeEqualToSize(vc.view.bounds.size, savedFrame.size) && (vc.view.center.x - savedCenter.x < 1 && savedCenter.x - vc.view.center.x < 1) && (vc.view.center.y - savedCenter.y < 1 && savedCenter.y - vc.view.center.y < 1);
+    if (!viewOK) {
+        vc.view.transform = CGAffineTransformIdentity;
+        CGRect restoredFrame = savedFrame;
+        if (restoredFrame.origin.x > screenSize.width - 100 || restoredFrame.origin.x + restoredFrame.size.width < 100) {
+            CGFloat restoredW = fmin(restoredFrame.size.width > 0 ? restoredFrame.size.width : screenSize.width * 0.85, screenSize.width);
+            CGFloat restoredH = fmin(restoredFrame.size.height > 0 ? restoredFrame.size.height : screenSize.height * 0.7, screenSize.height);
+            restoredFrame = CGRectMake((screenSize.width - restoredW) / 2, (screenSize.height - restoredH) / 2, restoredW, restoredH);
+        }
+        vc.view.frame = restoredFrame;
+        vc.view.transform = dockTransform;
+        vc.view.alpha = 0;
+        vc.view.hidden = YES;
+    }
+    // Tab window: must exist and sit at the left edge, at the saved
+    // frame's height. Rebuilt here if it was dropped.
+    CGFloat tabY = MultitaskFloatDockTabY(vc, savedFrame, window, screenSize);
+    MultitaskFloatEnsureDockTabWindow(vc, tabY, window);
+    UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
+    if (dockWindow) dockWindow.hidden = NO;
+    UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
+    if (dragBar) dragBar.hidden = YES;
+}
+
+static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
+    if (!vc.view || !vc.view.window || !vc.view.superview) return;
+    // v66: a dock already sliding must not be re-entered — repeated
+    // taps in the slide window stacked a second dock/minimize on
+    // top of the first and left the window at a side position.
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) return;
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
+    // v63: only one docked window — if a DIFFERENT window is already
+    // docked, prompt and refuse this dock (leave this window as it
+    // was, keep the docked one). Same-window re-dock is already
+    // blocked above (docked flag), and its pill is hidden anyway.
+    if (MultitaskFloatDockedVC && MultitaskFloatDockedVC != vc) {
+        if (!vc.presentedViewController) {
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"只能吸附一个窗口" message:@"已经有一个窗口吸附在左边了，先恢复它再吸附这个。" preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+            [vc presentViewController:alert animated:YES completion:nil];
+        }
+        return;
+    }
+    UIWindow *window = vc.view.window;
+    CGSize screenSize = window.bounds.size;
+    // v77: save the frame the window has now, so restore (and the
+    // re-assert) can put it back even if the host moves it while
+    // docked. Only a mostly-on-screen frame is worth saving — if
+    // the host already moved it to a side slot, keep the last good
+    // frame (or a centered default) instead of saving the stranded
+    // one.
+    CGRect frameNow = vc.view.frame;
+    BOOL frameNowOnScreen = frameNow.size.width > 0 && frameNow.size.height > 0 && frameNow.origin.x <= screenSize.width - 100 && frameNow.origin.x + frameNow.size.width >= 100;
+    NSValue *prevSavedFrame = objc_getAssociatedObject(vc, &kMultitaskFloatDockSavedFrameKey);
+    CGRect savedFrame = frameNow;
+    if (!frameNowOnScreen) {
+        if (prevSavedFrame) {
+            savedFrame = [prevSavedFrame CGRectValue];
+        } else {
+            CGFloat defaultW = screenSize.width * 0.85, defaultH = screenSize.height * 0.7;
+            savedFrame = CGRectMake((screenSize.width - defaultW) / 2, (screenSize.height - defaultH) / 2, defaultW, defaultH);
+        }
+    }
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockSavedFrameKey, [NSValue valueWithCGRect:savedFrame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // v77: tab + dock window (created / re-placed at the left edge).
+    // Kept hidden until the window has slid away, so the window
+    // appears to become the tab.
+    CGFloat tabYInWindow = MultitaskFloatDockTabY(vc, savedFrame, window, screenSize);
+    MultitaskFloatEnsureDockTabWindow(vc, tabYInWindow, window);
+    UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
     objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MultitaskFloatDockedVC = vc; // v63: single dock — record the docked window
     objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingStartKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v77: stale-flag detection
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
     // Slide the window off-screen toward the dock edge + fade out;
     // the drag bar fades where it was (it does not slide with the
@@ -2260,6 +2476,7 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         if (dragBar) dragBar.hidden = YES;
         dockWindow.hidden = NO;
         objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v77
     }];
 }
 
@@ -2270,6 +2487,7 @@ static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
     if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey) boolValue]) return;
     if (![objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
     objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingStartKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v77: stale-flag detection
     // Hide the dock window first: the window slides back from the
     // edge as the tab vanishes, so the tab reads as becoming the
     // window. Hiding + clearing the window also releases the tab
@@ -2283,6 +2501,36 @@ static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
     objc_setAssociatedObject(vc, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (MultitaskFloatDockedVC == vc) MultitaskFloatDockedVC = nil; // v63: dock slot frees on restore
+    // v77: restore the frame the window had when it docked — the
+    // host may have moved it while docked, and restoring transform
+    // alone would land it at the host's (right-edge) frame. Do it
+    // with transform identity, then re-apply the dock slide before
+    // unhiding, so nothing flashes on-screen at the wrong place. A
+    // saved frame that is itself mostly off-screen is ignored in
+    // favour of centering the current frame.
+    CGSize restoreScreenSize = vc.view.window ? vc.view.window.bounds.size : [UIScreen mainScreen].bounds.size;
+    vc.view.transform = CGAffineTransformIdentity;
+    NSValue *savedRestoreFrame = objc_getAssociatedObject(vc, &kMultitaskFloatDockSavedFrameKey);
+    BOOL frameRestored = NO;
+    if (savedRestoreFrame) {
+        CGRect savedRestoreRect = [savedRestoreFrame CGRectValue];
+        if (savedRestoreRect.size.width > 0 && savedRestoreRect.size.height > 0 && savedRestoreRect.origin.x <= restoreScreenSize.width - 100 && savedRestoreRect.origin.x + savedRestoreRect.size.width >= 100) {
+            vc.view.frame = savedRestoreRect;
+            frameRestored = YES;
+        }
+    }
+    if (!frameRestored) {
+        // No usable saved frame (e.g. docked by a pre-v77 build):
+        // at least never restore to a mostly-off-screen frame.
+        CGRect curRestoreFrame = vc.view.frame;
+        if (curRestoreFrame.size.width > 0 && curRestoreFrame.size.height > 0 && (curRestoreFrame.origin.x > restoreScreenSize.width - 100 || curRestoreFrame.origin.x + curRestoreFrame.size.width < 100)) {
+            CGFloat restoreW = fmin(curRestoreFrame.size.width, restoreScreenSize.width);
+            CGFloat restoreH = fmin(curRestoreFrame.size.height, restoreScreenSize.height);
+            vc.view.frame = CGRectMake((restoreScreenSize.width - restoreW) / 2, (restoreScreenSize.height - restoreH) / 2, restoreW, restoreH);
+        }
+    }
+    vc.view.transform = CGAffineTransformMakeTranslation(-restoreScreenSize.width, 0);
+    vc.view.alpha = 0;
     // Unhide at the docked transform (off-screen, alpha 0), so
     // unhiding flashes nothing; then slide back to identity + fade
     // in. The drag bar (small windows only — maximized hides it)
@@ -2307,6 +2555,7 @@ static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
     } completion:^(BOOL finished) {
         (void)finished;
         objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v77
         MultitaskFloatSyncWindowChrome(vc);
         MultitaskFloatStartDisplayLink(vc);
     }];
