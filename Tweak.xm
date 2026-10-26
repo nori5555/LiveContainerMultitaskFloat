@@ -2172,6 +2172,15 @@ static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
     BOOL showBar = !vc.isMaximized;
     if (dragBar && showBar) dragBar.hidden = NO;
+    // v64: bring the restored window to the very front (above any
+    // fullscreen window) BEFORE sliding back, so the slide is visible
+    // and the window does not land behind a fullscreen app. Pinned
+    // windows must stay on top (v40) — restore must not break that.
+    UIView *restoreParent = vc.view.superview;
+    if (restoreParent) {
+        [restoreParent bringSubviewToFront:vc.view];
+        if (dragBar) [restoreParent insertSubview:dragBar aboveSubview:vc.view];
+    }
     [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
         vc.view.transform = CGAffineTransformIdentity;
         vc.view.alpha = 1;
