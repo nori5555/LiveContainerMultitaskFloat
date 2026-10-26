@@ -339,6 +339,7 @@ static const char kMultitaskFloatPillKey = 0;
 static const char kMultitaskFloatPillPlacedKey = 0;
 static const char kMultitaskFloatDragBarKey = 0;
 static const char kMultitaskFloatAnimatingOpenKey = 0;
+static const char kMultitaskFloatAnimatingOpenStartKey = 0; // v71: pop start time, for stale-flag detection
 static const char kMultitaskFloatPinnedKey = 0;
 static const char kMultitaskFloatDotKey = 0;
 static const char kMultitaskFloatDotTapTimeKey = 0;
@@ -354,6 +355,7 @@ static const char kMultitaskFloatDockedKey = 0;
 static const char kMultitaskFloatDockTabKey = 0;
 static const char kMultitaskFloatDockWindowKey = 0; // v61: separate window so the tab stays above any app
 static const char kMultitaskFloatDockAnimatingKey = 0; // v66: dock/restore animation in flight
+static const char kMultitaskFloatWatchdogKey = 0; // v71: permanent chrome watchdog running
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -844,7 +846,10 @@ static void MultitaskFloatApplyCornerMask(UIView *view, CGFloat radius) {
     BOOL wantMask = (radius > 0 && CGRectGetWidth(view.bounds) > 0 && CGRectGetHeight(view.bounds) > 0);
     NSValue *cachedBounds = objc_getAssociatedObject(view, &kMultitaskFloatMaskBoundsKey);
     NSNumber *cachedRadius = objc_getAssociatedObject(view, &kMultitaskFloatMaskRadiusKey);
-    if (cachedBounds && cachedRadius && CGRectEqualToRect([cachedBounds CGRectValue], view.bounds) && [cachedRadius doubleValue] == radius && ((wantMask && view.layer.mask != nil) || (!wantMask && view.layer.mask == nil))) return;
+    // v71: also require the existing mask to be OUR shape layer — the
+    // old check only verified a mask exists, so a mask the host put
+    // there (e.g. its own square clip) defeated the rebuild forever.
+    if (cachedBounds && cachedRadius && CGRectEqualToRect([cachedBounds CGRectValue], view.bounds) && [cachedRadius doubleValue] == radius && ((wantMask && [view.layer.mask isKindOfClass:[CAShapeLayer class]]) || (!wantMask && view.layer.mask == nil))) return;
     if (!wantMask) {
         view.layer.mask = nil;
     } else {
@@ -881,7 +886,21 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     // would lose its rounded clip mid-flight (maximized clears
     // clipping outright). The drag bar and pill border below still
     // sync. The animation's completion re-syncs chrome itself.
+    // v71: stale-flag guard. The pop is ~0.6s; if the flag is still
+    // set 2s after the pop started, its completion never ran (the
+    // v69 animator bug, or any future lost completion) — clear it
+    // here, or the window stays square and barless forever: the
+    // mask section below is skipped while the flag is set, and the
+    // drag bar stays hidden.
     BOOL animatingOpen = [objc_getAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey) boolValue];
+    if (animatingOpen) {
+        NSNumber *animStart = objc_getAssociatedObject(vc, &kMultitaskFloatAnimatingOpenStartKey);
+        if (animStart && ([[NSDate date] timeIntervalSince1970] - [animStart doubleValue] > 2.0)) {
+            objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            animatingOpen = NO;
+        }
+    }
     // v58: force rounded chrome during ANY toggle animation
     // (maximize and minimize/restore). The toggle animates over
     // ~0.3s and isMaximized can stay stale through it, so a plain
@@ -1503,6 +1522,7 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     view.alpha = 0;
     view.transform = CGAffineTransformMakeScale(startScale, startScale);
     objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenStartKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v71: stale-flag detection
     // v31: bottom-strip cover (the user's suggestion). During the pop
     // the scaled view does not fill the window, so the LiveContainer
     // list underneath peeks through at the edges — most visible at
@@ -1630,6 +1650,7 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
     // still animates.
     void (^popCompletion)(void) = ^{
         objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // Restore the default anchor (invisible: transform is identity).
         CALayer *l = view.layer;
         CGPoint curAnchor = l.anchorPoint;
@@ -1836,6 +1857,28 @@ static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
     } @catch (NSException *e) {}
 }
 
+// v71: permanent chrome watchdog. The display link stops after 5s
+// and the fixed timers end at 30s, but the host can reset the
+// window's clipping later (activation, video, rotation) with no
+// layout pass afterward — the window then stays square until the
+// user resizes it. Re-sync every 5s while the window exists;
+// SyncWindowChrome is idempotent and mostly no-op when nothing
+// changed, so one pass per window every 5s costs nothing. The
+// chain stops itself when the window goes away, and the flag
+// prevents duplicate chains across re-appears.
+static void MultitaskFloatChromeWatchdog(DecoratedAppSceneViewController *vc) {
+    if (!vc.view.window) {
+        objc_setAssociatedObject(vc, &kMultitaskFloatWatchdogKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    MultitaskFloatSyncWindowChrome(vc);
+    __weak DecoratedAppSceneViewController *weakVC = vc;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC) MultitaskFloatChromeWatchdog(strongVC);
+    });
+}
+
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (origViewDidAppear) origViewDidAppear(self, _cmd, animated);
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
@@ -1981,6 +2024,11 @@ static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     });
     // v51: start the per-frame link (no-op if one is already running).
     MultitaskFloatStartDisplayLink(vc);
+    // v71: start the permanent chrome watchdog (no-op if already running).
+    if (![objc_getAssociatedObject(vc, &kMultitaskFloatWatchdogKey) boolValue]) {
+        objc_setAssociatedObject(vc, &kMultitaskFloatWatchdogKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        MultitaskFloatChromeWatchdog(vc);
+    }
 }
 
 // viewDidLayoutSubviews: re-sync window chrome after EVERY layout
