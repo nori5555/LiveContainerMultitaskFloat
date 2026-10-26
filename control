@@ -2,7 +2,7 @@ Package: com.example.multitaskfloat
 Name: Multitask Float Bar for LiveContainer
 Version: 1.0.0
 Architecture: iphoneos-arm64
-Description: Simplifies LiveContainer multitasking window bars: keeps only the app title menu and the minimize button, and turns the bar into a dark translucent strip floating over the app instead of a fixed row.
+Description: Simplifies LiveContainer multitasking windows: a draggable floating pill with only the minimize, maximize and close buttons, no side multitask dock, plus pin-to-front, left-edge docking for pinned windows, and a one-tap multitask dot in the app list.
 Maintainer: Local build
 Author: Local build
 Section: Tweaks
