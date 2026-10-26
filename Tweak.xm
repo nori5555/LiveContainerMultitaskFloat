@@ -36,6 +36,14 @@
 // back on-screen, so an already-stranded window recovers on the
 // next layout/watchdog tick instead of staying stuck at the edge.
 
+// v78: open animation now has a haptic — one medium impact from
+// UIImpactFeedbackGenerator as the pop starts, so the window
+// growing out of the tapped icon is felt as well as seen. One
+// pulse only, at pop start (not at landing, not per glyph), so it
+// reads as the pop itself rather than a buzz. It is a no-op on
+// devices without a Taptic Engine and needs no entitlement or new
+// framework (UIKit only).
+
 // LiveContainer's multitasking virtual windows are DecoratedAppSceneViewController:
 // a vertical stack of [44pt UINavigationBar, content]. The bar holds the app
 // title (with its title menu, the "AssppPro v" control) and three
@@ -1782,6 +1790,13 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
             }];
         }
     };
+    // v78: one medium haptic as the pop starts — the window is
+    // felt growing out of the tapped icon, not just seen. Fired
+    // here, immediately before the spring starts, so the tap and
+    // the first frame of the pop coincide. One pulse only.
+    UIImpactFeedbackGenerator *openHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [openHaptic prepare];
+    [openHaptic impactOccurred];
     [UIView animateWithDuration:0.6 delay:0 usingSpringWithDamping:0.77 initialSpringVelocity:0 options:0 animations:^{
         view.alpha = 1;
         view.transform = CGAffineTransformIdentity;
