@@ -1519,6 +1519,66 @@ static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
             MultitaskFloatSyncWindowChrome(strongVC);
         }
     });
+    // v50: poll to 30s. v49's timers (to 8s) and tap sync both
+    // failed on ins/Xiaohongshu — user 11:31: only a bottom-right
+    // resize rounds the corners. A resize changes bounds and
+    // forces a layout that rebuilds the mask from final bounds;
+    // timers and taps do not change bounds, so they rebuild from
+    // whatever bounds are current, which are stale if the host's
+    // final geometry settles later than 8s. Polling every 2s to
+    // 20s, then 25s and 30s, covers a late settle: whenever the
+    // host's final geometry lands, a sync follows within 2-5s
+    // and rebuilds from final bounds. Same window guard (a
+    // closed window never re-syncs, so a closed bar is never
+    // recreated). Idempotent; no new lifecycle, just timers.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(14 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(18 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
 }
 
 // viewDidLayoutSubviews: re-sync window chrome after EVERY layout
