@@ -866,7 +866,20 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         // the device radius. Left untouched while animatingOpen
         // (the pop animates cornerRadius itself; a rounded mask
         // would freeze it rounded and snap square at completion).
-        if (effectiveMaximized) {
+        // v59: during a toggle animation, clear the mask outright —
+        // the mask is built from MODEL bounds (already final), while
+        // the window's PRESENTATION is still animating, so a
+        // model-sized mask clips the animating window to the wrong
+        // size (large→small looks smeared/cut, list bleeds through
+        // the window interior). cornerRadius+masksToBounds (above)
+        // track the presentation, so they alone clip correctly
+        // during the animation; the mask is rebuilt from final
+        // bounds once settled (its presence check forces a rebuild
+        // after a clear).
+        if (inToggle) {
+            vc.view.layer.mask = nil;
+            if (sceneView) sceneView.layer.mask = nil;
+        } else if (effectiveMaximized) {
             MultitaskFloatApplyCornerMask(vc.view, 0);
             MultitaskFloatApplyCornerMask(sceneView, 0);
         } else {
@@ -1241,6 +1254,14 @@ static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
         DecoratedAppSceneViewController *strongVC = weakVC;
         if (strongVC && strongVC.view.window) {
             MultitaskFloatSyncWindowChrome(strongVC);
+            // v59: nudge the guest to re-layout for its new size —
+            // after a shrink, the guest can keep its maximized
+            // layout (clipped on the right) until something forces
+            // a layout pass; one explicit pass at settle time
+            // reflows it to the small width instead of leaving it
+            // clipped.
+            UIView *sceneView = strongVC.appSceneVC.view;
+            if (sceneView) { [sceneView setNeedsLayout]; [sceneView layoutIfNeeded]; }
             // v40: re-assert pinned on top once the toggle animation
             // has settled (the host can reorder windows mid-animation).
             MultitaskFloatBringPinnedToFront();
@@ -1266,6 +1287,14 @@ static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
         DecoratedAppSceneViewController *strongVC = weakVC;
         if (strongVC && strongVC.view.window) {
             MultitaskFloatSyncWindowChrome(strongVC);
+            // v59: nudge the guest to re-layout for its new size —
+            // after a shrink, the guest can keep its maximized
+            // layout (clipped on the right) until something forces
+            // a layout pass; one explicit pass at settle time
+            // reflows it to the small width instead of leaving it
+            // clipped.
+            UIView *sceneView = strongVC.appSceneVC.view;
+            if (sceneView) { [sceneView setNeedsLayout]; [sceneView layoutIfNeeded]; }
             // v40: re-assert pinned on top once the toggle animation
             // has settled (the host can reorder windows mid-animation).
             MultitaskFloatBringPinnedToFront();
