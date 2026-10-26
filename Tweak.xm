@@ -359,6 +359,13 @@ static const char kMultitaskFloatDockWindowKey = 0; // v61: separate window so t
 // on the first pin (never in the constructor).
 static NSHashTable *MultitaskFloatPinnedWindows = nil;
 
+// Docked window (v63): only ONE window may be docked at a time. A
+// single weak ref (not a set) — it zeroes out on its own if the
+// window goes away without cleanup, and it is cleared explicitly on
+// restore/close/disappear. Set on dock, checked before docking
+// another window (prompt + refuse if one is already docked).
+static __weak DecoratedAppSceneViewController *MultitaskFloatDockedVC = nil;
+
 // Forward declaration: defined after InitImpl, used by it.
 static void MultitaskFloatAddDragGesture(DecoratedAppSceneViewController *vc);
 
@@ -1278,6 +1285,7 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
                 if (dockTab) [dockTab removeFromSuperview];
                 objc_setAssociatedObject(strongVC, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(strongVC, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (MultitaskFloatDockedVC == strongVC) MultitaskFloatDockedVC = nil; // v63: dock slot frees on close
                 objc_setAssociatedObject(strongVC, &kMultitaskFloatClosingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 if (strongVC.view.window && origCloseWindow) origCloseWindow(strongVC, _cmd);
             }
@@ -1302,6 +1310,7 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
     if (dockTab) [dockTab removeFromSuperview];
     objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(self, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (MultitaskFloatDockedVC == self) MultitaskFloatDockedVC = nil; // v63: dock slot frees on close
 }
 
 // v55: forward declaration — maximize/minimize call StartDisplayLink,
@@ -1715,6 +1724,7 @@ static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
     if (dockTab) [dockTab removeFromSuperview];
     objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(self, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (MultitaskFloatDockedVC == self) MultitaskFloatDockedVC = nil; // v63: dock slot frees on disappear
     // v51: stop the per-frame link when the window goes away, so a
     // closed window never keeps ticking (the tick also stops itself
     // on nil window, this is the prompt path).
@@ -2044,6 +2054,18 @@ static void MultitaskFloatTogglePin(id self, SEL _cmd, UITapGestureRecognizer *s
 static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     if (!vc.view || !vc.view.window || !vc.view.superview) return;
     if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
+    // v63: only one docked window — if a DIFFERENT window is already
+    // docked, prompt and refuse this dock (leave this window as it
+    // was, keep the docked one). Same-window re-dock is already
+    // blocked above (docked flag), and its pill is hidden anyway.
+    if (MultitaskFloatDockedVC && MultitaskFloatDockedVC != vc) {
+        if (!vc.presentedViewController) {
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"只能吸附一个窗口" message:@"已经有一个窗口吸附在左边了，先恢复它再吸附这个。" preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+            [vc presentViewController:alert animated:YES completion:nil];
+        }
+        return;
+    }
     UIView *parent = vc.view.superview;
     UIWindow *window = vc.view.window;
     CGSize screenSize = window.bounds.size;
@@ -2104,6 +2126,7 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         if (tab.superview != dockWindow) [dockWindow addSubview:tab];
     }
     objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    MultitaskFloatDockedVC = vc; // v63: single dock — record the docked window
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
     // Slide the window off-screen toward the dock edge + fade out;
     // the drag bar fades where it was (it does not slide with the
@@ -2140,6 +2163,7 @@ static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
     if (tab) [tab removeFromSuperview];
     objc_setAssociatedObject(vc, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (MultitaskFloatDockedVC == vc) MultitaskFloatDockedVC = nil; // v63: dock slot frees on restore
     // Unhide at the docked transform (off-screen, alpha 0), so
     // unhiding flashes nothing; then slide back to identity + fade
     // in. The drag bar (small windows only — maximized hides it)
