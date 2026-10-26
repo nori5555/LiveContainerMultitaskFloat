@@ -1126,6 +1126,11 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
     }
 }
 
+// v55: forward declaration — maximize/minimize call StartDisplayLink,
+// which is defined later in the file; ObjC++ requires declaration
+// before use (v53/v54 failed to compile without it).
+static void MultitaskFloatStartDisplayLink(DecoratedAppSceneViewController *vc);
+
 static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
     if (origMaximizeWindow) origMaximizeWindow(self, _cmd);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
