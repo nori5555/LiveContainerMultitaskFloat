@@ -342,6 +342,8 @@ static const char kMultitaskFloatAnimatingOpenKey = 0;
 static const char kMultitaskFloatPinnedKey = 0;
 static const char kMultitaskFloatDotKey = 0;
 static const char kMultitaskFloatDotTapTimeKey = 0;
+static const char kMultitaskFloatDisplayLinkKey = 0;
+static const char kMultitaskFloatDisplayLinkStartKey = 0;
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -1454,6 +1456,58 @@ static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
         [dragBar removeFromSuperview];
         objc_setAssociatedObject(self, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    // v51: stop the per-frame link when the window goes away, so a
+    // closed window never keeps ticking (the tick also stops itself
+    // on nil window, this is the prompt path).
+    id link = objc_getAssociatedObject(self, &kMultitaskFloatDisplayLinkKey);
+    if (link) {
+        @try { ((void (*)(id, SEL))objc_msgSend)(link, @selector(invalidate)); } @catch (NSException *e) {}
+        objc_setAssociatedObject(self, &kMultitaskFloatDisplayLinkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, &kMultitaskFloatDisplayLinkStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+// v51: per-frame chrome re-sync via CADisplayLink (runtime lookup,
+// no QuartzCore link). v50 rounds, but too slowly: timers (even
+// every 2s) leave up to 2s of square after every host reset, and
+// the host resets repeatedly during load, so the window only
+// looks round once the host stops resetting. A display link
+// re-applies chrome every frame, so the window reads as round
+// from the start (at most one frame of square after a reset),
+// instead of waiting for the next timer. Runs 30s (polls to 30s
+// remain as fallback), stops early on close (viewDidDisappear)
+// or nil window, skips when maximized (no corners to fix there,
+// link stays alive for restore). Idempotent; guard prevents
+// duplicates on re-appear (a stopped link clears its association,
+// so a fresh appear starts a fresh link).
+static void MultitaskFloatStartDisplayLink(DecoratedAppSceneViewController *vc) {
+    if (!vc.view.window) return;
+    if (objc_getAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey)) return;
+    @try {
+        Class dlCls = objc_getClass("CADisplayLink");
+        if (!dlCls) return;
+        id link = ((id (*)(id, SEL, id, SEL))objc_msgSend)(dlCls, @selector(displayLinkWithTarget:selector:), vc, @selector(MultitaskFloatDisplayLinkTick:));
+        if (!link) return;
+        ((void (*)(id, SEL, id, id))objc_msgSend)(link, @selector(addToRunLoop:forMode:), [NSRunLoop mainRunLoop], NSDefaultRunLoopMode);
+        objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey, link, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (NSException *e) {}
+}
+
+static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    @try {
+        NSTimeInterval start = [objc_getAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey) doubleValue];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (!vc.view.window || (start > 0 && now - start > 30.0)) {
+            ((void (*)(id, SEL))objc_msgSend)(link, @selector(invalidate));
+            objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return;
+        }
+        if (vc.isMaximized) return;
+        MultitaskFloatSyncWindowChrome(vc);
+    } @catch (NSException *e) {}
 }
 
 static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
@@ -1579,6 +1633,8 @@ static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
             MultitaskFloatSyncWindowChrome(strongVC);
         }
     });
+    // v51: start the per-frame link (no-op if one is already running).
+    MultitaskFloatStartDisplayLink(vc);
 }
 
 // viewDidLayoutSubviews: re-sync window chrome after EVERY layout
@@ -2118,6 +2174,8 @@ static void MultitaskFloatConstructor(void) {
     // Floating pill handlers are new selectors too, so adding them is safe.
     class_addMethod(cls, @selector(MultitaskFloatPillPan:), (IMP)MultitaskFloatPillPan, "v@:@");
     class_addMethod(cls, @selector(MultitaskFloatPillButton:), (IMP)MultitaskFloatPillButton, "v@:@");
+    // v51: per-frame tick is a new selector too, so adding it is safe.
+    class_addMethod(cls, @selector(MultitaskFloatDisplayLinkTick:), (IMP)MultitaskFloatDisplayLinkTick, "v@:@");
     // Last-tap capture for the icon-origin open animation: UIWindow
     // implements sendEvent:, so swap its implementation (orig first,
     // then record). Pure runtime, no UIKit work in the constructor.
