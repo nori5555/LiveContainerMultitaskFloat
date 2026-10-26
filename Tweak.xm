@@ -1153,6 +1153,39 @@ static void MultitaskFloatSendEvent(id self, SEL _cmd, UIEvent *event) {
         }
     } @catch (NSException *e) {}
     if (origSendEvent) origSendEvent(self, _cmd, event);
+    // v49: touch-ended re-sync. v48's 2.5s timer was too early:
+    // Xiaohongshu's load-completion reset lands after 2.5s, so the
+    // timer's mask is wiped and no layout fires afterward. The
+    // user's discovery (tapping the window during its loading
+    // animation rounds the corners) shows a post-reset layout is
+    // what sticks — a tap forces one. Mirror that automatically:
+    // after every tap ends, re-sync the touched window's chrome,
+    // deferred to the next runloop so the tap's own layout has
+    // settled. The responder walk finds the Decorated VC through
+    // its scene child; taps on the list find none and no-op.
+    // Guarded by window (a closed window never re-syncs).
+    // Idempotent; only fires on touch-ended, never on moves.
+    @try {
+        if (event.type == UIEventTypeTouches) {
+            Class decoratedCls = objc_getClass("DecoratedAppSceneViewController");
+            if (decoratedCls) {
+                for (UITouch *touch in event.allTouches) {
+                    if (touch.phase != UITouchPhaseEnded) continue;
+                    UIResponder *r = touch.view;
+                    while (r && ![r isKindOfClass:decoratedCls]) r = r.nextResponder;
+                    if (r) {
+                        __weak DecoratedAppSceneViewController *weakVC = (DecoratedAppSceneViewController *)r;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            DecoratedAppSceneViewController *strongVC = weakVC;
+                            if (strongVC && strongVC.view.window) {
+                                MultitaskFloatSyncWindowChrome(strongVC);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {}
 }
 
 // Open animation, v25: grow from the tapped icon (like iOS opening
@@ -1463,6 +1496,24 @@ static void MultitaskFloatViewDidAppear(id self, SEL _cmd, BOOL animated) {
     // with no toggle. Guarded by window (a closed window never
     // re-syncs, so a closed bar is never recreated). Idempotent.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    // v49: later shots. v48's 2.5s was too early for Xiaohongshu:
+    // its load-completion reset lands after 2.5s, wiping the
+    // timer's mask, and the user's tap-during-animation discovery
+    // shows only a post-reset layout sticks. 5s and 8s cover a
+    // slower load without needing a tap (the touch-ended sync
+    // above covers the tap case). Same window guard, idempotent.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DecoratedAppSceneViewController *strongVC = weakVC;
+        if (strongVC && strongVC.view.window) {
+            MultitaskFloatSyncWindowChrome(strongVC);
+        }
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         DecoratedAppSceneViewController *strongVC = weakVC;
         if (strongVC && strongVC.view.window) {
             MultitaskFloatSyncWindowChrome(strongVC);
