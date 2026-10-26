@@ -73,6 +73,37 @@
 // haptics off feels nothing; it is a no-op without a Taptic
 // Engine, and needs no entitlement or new framework.
 
+// v81: the dock is gone, not hidden. The user asked to remove the
+// dock outright instead of hiding it, and the LiveContainer source
+// (MultitaskSupport/MultitaskDockView.swift, LiveContainer/
+// LiveContainer) shows it is safe from a tweak: the dock only
+// exists as MultitaskDockManager.shared.hostingController (a
+// UIHostingController created once, async, by setupDockView() in
+// init); the dock view only enters the window hierarchy in
+// showDock(), and every dock method (showDock, hideDock,
+// updateDockFrame) guards on hostingController with `guard let` —
+// there is not one force-unwrap of it in the file, and no other
+// file touches it (other files only use windowHostingView — the
+// container the floating windows themselves live in, which must
+// stay — plus addRunningApp, bringMultitaskViewToFront, and a read
+// of isCollapsed). So nil-ing hostingController (KVC, same lookup
+// the v14 hide path already uses to read it) makes the whole dock
+// inert: no view, no SwiftUI body, no frame updates, no edge
+// gestures. The manager singleton still exists (the host holds
+// it), but it can do nothing — that is as close to "no dock" as a
+// tweak gets; truly deleting the manager object would need a
+// LiveContainer source change. The kill verifies by reading back:
+// if the KVC write did not stick, it falls back to the old hide
+// path so the dock can never come back visible. setupDockView
+// runs async at manager init, so the kill re-runs (async re-check
+// + 5s watchdog) until the read-back confirms nil. The old
+// per-layout HideDockFully call is gone with it — that also
+// removes the per-layout class-list scan / NSUserDefaults alloc /
+// KVC churn the heat review flagged. The class lookup is cached
+// (one scan ever). Never call the kill from the ctor: [shared]
+// would create the manager before a key window exists, and its
+// init force-unwraps keyWindow.
+
 // LiveContainer's multitasking virtual windows are DecoratedAppSceneViewController:
 // a vertical stack of [44pt UINavigationBar, content]. The bar holds the app
 // title (with its title menu, the "AssppPro v" control) and three
@@ -487,6 +518,20 @@ static Class MultitaskFloatDockManagerClass(void) {
     return cls;
 }
 
+// v81: cache the dock manager class — the lookup above scans the
+// whole ObjC class list when the bare name misses (a Swift class is
+// module-prefixed), and it used to run on every layout pass via
+// HideDockFully. One scan ever; the class object never changes.
+static Class MultitaskFloatDockManagerClassCached(void) {
+    static Class cached = Nil;
+    static BOOL lookedUp = NO;
+    if (!lookedUp) {
+        lookedUp = YES;
+        cached = MultitaskFloatDockManagerClass();
+    }
+    return cached;
+}
+
 // Any path that would bring the dock back is redirected to hide it again.
 static void MultitaskFloatHideDockManager(id manager) {
     if (!manager) return;
@@ -541,21 +586,56 @@ static void MultitaskFloatHideDockManager(id manager) {
     } @catch (id e) {}
 }
 
-static void MultitaskFloatHideDockFully(void) {
-    Class cls = MultitaskFloatDockManagerClass();
+// v81: kill the dock instead of hiding it. Nil-ing the manager's
+// hostingController (see the v81 header note for why this is safe:
+// every dock method guards on it, nothing else touches it) and
+// removing its view first if it is already in the hierarchy. The
+// write is verified by reading back — if KVC did not stick, fall
+// back to the old hide path so the dock can never come back
+// visible. Cheap when already dead: one cached class lookup, one
+// shared access, one KVC read. Never call from the ctor (see the
+// v81 header note: [shared] before a key window exists would crash
+// the manager's init on its keyWindow! force-unwrap).
+static void MultitaskFloatKillDock(void) {
+    Class cls = MultitaskFloatDockManagerClassCached();
     if (!cls) return;
-    if (!class_getInstanceMethod(cls, @selector(hideDockToSide))) return;
     id manager = nil;
     @try {
         manager = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(shared));
     } @catch (id e) {
-        manager = nil;
+        return;
     }
-    MultitaskFloatHideDockManager(manager);
+    if (!manager) return;
+    @try {
+        id hc = [manager valueForKey:@"hostingController"];
+        if (hc) {
+            UIView *dockView = [hc valueForKey:@"view"];
+            if (dockView) [dockView removeFromSuperview];
+            [manager setValue:nil forKey:@"hostingController"];
+        }
+        // Verify the write stuck; if it did not (a Swift
+        // stored-property quirk), hide the dock the old way.
+        if ([manager valueForKey:@"hostingController"]) {
+            MultitaskFloatHideDockManager(manager);
+        }
+    } @catch (id e) {
+        // KVC failure: fall back to hiding, never crash on the dock.
+        @try { MultitaskFloatHideDockManager(manager); } @catch (id e2) {}
+    }
 }
 
-static void MultitaskFloatForceHideDock(id self, SEL _cmd) {
-    MultitaskFloatHideDockManager(self);
+// v81: no-op for the dock's show/hide/toggle paths and for the
+// edge-swipe handler. With hostingController nil, the Swift-side
+// methods already return early; these redirects stop the ObjC-side
+// callers from doing anything at all — in particular hideDockToSide
+// no longer installs the screen-edge swipe gestures that would
+// bring the dock back.
+static void MultitaskFloatDockNoop(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+}
+
+static void MultitaskFloatDockNoopGesture(id self, SEL _cmd, id gesture) {
+    (void)self; (void)_cmd; (void)gesture;
 }
 
 // v62: setter swizzle — force isCollapsed to YES so the dock can
@@ -572,25 +652,34 @@ static void MultitaskFloatSetIsCollapsed(id self, SEL _cmd, BOOL collapsed) {
 
 static void MultitaskFloatSwizzleDock(void) {
     if (dockSwizzled) return;
-    Class cls = MultitaskFloatDockManagerClass();
+    Class cls = MultitaskFloatDockManagerClassCached();
     if (!cls) return;
-    // Only redirect the re-show paths when the hide path actually exists,
-    // so the redirect never sends an unimplemented selector. showDock
-    // is redirected too: it re-adds the hosting view and animates it
-    // to full alpha, so leaving it alone would bring the dock back
-    // even with the other paths redirected. Redirecting to the hide
-    // helper (a supported hide, not a no-op) keeps state consistent.
-    if (!class_getInstanceMethod(cls, @selector(hideDockToSide))) return;
+    // v81: the dock is removed, not hidden, so every path that
+    // could show it or arm its edge gestures is a no-op now — not a
+    // redirect to the hide helper (there is nothing left to hide).
+    // Only redirect when the methods actually exist, so the
+    // redirect never sends an unimplemented selector.
     Method mShowDock = class_getInstanceMethod(cls, @selector(showDock));
-    if (mShowDock) method_setImplementation(mShowDock, (IMP)MultitaskFloatForceHideDock);
+    if (mShowDock) method_setImplementation(mShowDock, (IMP)MultitaskFloatDockNoop);
     Method mShow = class_getInstanceMethod(cls, @selector(showDockFromHidden));
-    if (mShow) method_setImplementation(mShow, (IMP)MultitaskFloatForceHideDock);
+    if (mShow) method_setImplementation(mShow, (IMP)MultitaskFloatDockNoop);
     Method mToggle = class_getInstanceMethod(cls, @selector(toggleDockVisibility));
-    if (mToggle) method_setImplementation(mToggle, (IMP)MultitaskFloatForceHideDock);
+    if (mToggle) method_setImplementation(mToggle, (IMP)MultitaskFloatDockNoop);
+    Method mHideSide = class_getInstanceMethod(cls, @selector(hideDockToSide));
+    if (mHideSide) method_setImplementation(mHideSide, (IMP)MultitaskFloatDockNoop);
+    // The edge-swipe handler is @objc private, so it is in the
+    // runtime: no-op it too, so a swipe from the screen edge cannot
+    // wake the dock even if the gestures were installed before the
+    // tweak loaded.
+    Method mEdge = class_getInstanceMethod(cls, @selector(handleEdgeSwipe:));
+    if (mEdge) method_setImplementation(mEdge, (IMP)MultitaskFloatDockNoopGesture);
     // v62: also force the collapsed setter to YES, so a direct
     // setIsCollapsed:NO (e.g. host showing the dock when a window
-    // is hidden/docked) cannot bring the dock back. The show-method
-    // redirects above do not catch a direct setter call.
+    // is hidden/docked) cannot bring the dock back. The no-op
+    // redirects above do not catch a direct setter call. Kept in
+    // v81: DecoratedAppSceneViewController reads isCollapsed to
+    // decide whether to hide the window bar, and YES is the current
+    // behaviour.
     Method mSetCollapsed = class_getInstanceMethod(cls, @selector(setIsCollapsed:));
     if (mSetCollapsed) {
         origSetIsCollapsed = (MultitaskFloatSetCollapsedIMP)method_getImplementation(mSetCollapsed);
@@ -622,10 +711,15 @@ static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSStri
         DecoratedAppSceneViewController *dvc = (DecoratedAppSceneViewController *)vc;
         // All three traffic-light buttons stay; only the title/bar go away.
         MultitaskFloatStripBar(dvc);
-        // Dock: make sure the re-show redirects are in place, and move the
-        // dock off-screen through the supported path.
+        // Dock: make sure the no-op redirects are in place, and kill
+        // the dock outright (v81). The async re-kill runs after any
+        // pending setupDockView block (FIFO on the main queue), so a
+        // hostingController created at manager init is caught too.
         MultitaskFloatSwizzleDock();
-        MultitaskFloatHideDockFully();
+        MultitaskFloatKillDock();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MultitaskFloatKillDock();
+        });
         // Drag handle for the buttons when maximized (once per window).
         MultitaskFloatAddDragGesture(dvc);
         // Floating pill replacing the bar's buttons (once per window).
@@ -1283,8 +1377,9 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
         // IMP below), so every host recompute produces the compensated
         // value instead of wiping an after-the-fact update.
     }
-    // Keep the dock fully gone even if its view appears late.
-    MultitaskFloatHideDockFully();
+    // v81: no per-layout dock work — the dock has no hosting
+    // controller, so nothing can appear late; the 5s watchdog
+    // re-kills it if one ever shows up.
     // Place the floating pill once, when the window exists: top-right,
     // just below the status bar when maximized, at the decorated view's
     // top-right when windowed. After that the user owns the position.
@@ -2040,6 +2135,10 @@ static void MultitaskFloatChromeWatchdog(DecoratedAppSceneViewController *vc) {
         return;
     }
     MultitaskFloatSyncWindowChrome(vc);
+    // v81: re-kill the dock if a hostingController ever reappears
+    // (e.g. setupDockView ran after the last kill). Cheap when dead:
+    // one cached class lookup + one KVC read.
+    MultitaskFloatKillDock();
     // v77: re-assert the docked window (if any) on every tick —
     // opening another app is when the host re-parents windows, so
     // the dock must be re-checked continuously, not only on the
