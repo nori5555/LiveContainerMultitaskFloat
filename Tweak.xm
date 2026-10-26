@@ -1255,6 +1255,10 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
     BOOL inToggle = toggleTime && ([[NSDate date] timeIntervalSince1970] - [toggleTime doubleValue] < 0.4);
     BOOL isSmall = !vc.isMaximized || inToggle;
     BOOL alreadyClosing = [objc_getAssociatedObject(vc, &kMultitaskFloatClosingKey) boolValue];
+    // v70: a re-entrant tap during the fade is ignored — the first
+    // completion closes the window. Previously it fell through to
+    // the immediate path below and cut the fade short.
+    if (alreadyClosing) return;
     if (isSmall && vc.view.window && !alreadyClosing) {
         objc_setAssociatedObject(vc, &kMultitaskFloatClosingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // Stop the per-frame link now (window is going away; ticks
@@ -1298,8 +1302,7 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
         }];
         return;
     }
-    // Maximized close, re-entrant close, or no window: v48 immediate
-    // path (orig first, bar removed at once; viewDidDisappear stays
+    // Maximized close or no window: v48 immediate path (orig first, bar removed at once; viewDidDisappear stays
     // as the fallback for close paths that bypass closeWindow).
     if (origCloseWindow) origCloseWindow(self, _cmd);
     UIView *dragBar = objc_getAssociatedObject(self, &kMultitaskFloatDragBarKey);

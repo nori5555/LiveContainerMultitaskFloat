@@ -7,11 +7,16 @@ import UIKit
 // the ObjC runtime under a fixed name so Tweak.xm can find it with
 // objc_getClass, with no generated-header import needed. If the class
 // is ever missing at runtime, Tweak.xm falls back to its ObjC spring.
+// v70: animators are held in a set, one per in-flight pop. v69 kept
+// a single static slot, so a second window opening within ~0.6s
+// released the first window's animator mid-flight and its completion
+// (anchor restore, chrome re-sync, cover fade) never ran.
 @objc(MultitaskFloatOpenAnimator)
 public final class MultitaskFloatOpenAnimator: NSObject {
-    // The animator must be held until it finishes; a local-only
-    // animator could be released mid-flight.
-    private static var activeAnimator: UIViewPropertyAnimator?
+    // Every in-flight animator is held here until its own completion
+    // runs. A single slot cannot hold two overlapping pops (two
+    // windows opened in quick succession); a set can.
+    private static var activeAnimators: Set<UIViewPropertyAnimator> = []
 
     @objc public static func animatePop(
         view: UIView,
@@ -39,11 +44,11 @@ public final class MultitaskFloatOpenAnimator: NSObject {
             view.transform = .identity
             view.layer.cornerRadius = finalRadius
         }
-        animator.addCompletion { _ in
-            activeAnimator = nil
+        animator.addCompletion { [weak animator] _ in
+            if let animator = animator { activeAnimators.remove(animator) }
             completion()
         }
-        activeAnimator = animator
+        activeAnimators.insert(animator)
         animator.startAnimation()
     }
 }
