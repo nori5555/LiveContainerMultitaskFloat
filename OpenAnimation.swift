@@ -1,7 +1,7 @@
 import UIKit
 
-// v69: the open pop's spring, driven by Swift's native animation API
-// (UIViewPropertyAnimator + UISpringTimingParameters). The rest of the
+// v69: the open pop, driven by Swift's native animation API
+// (UIViewPropertyAnimator). The rest of the
 // open animation (anchor setup, bottom cover, handwriting reveal) stays
 // in Tweak.xm; this class only runs the pop itself. It is exposed to
 // the ObjC runtime under a fixed name so Tweak.xm can find it with
@@ -15,6 +15,9 @@ import UIKit
 // the cover fade and the handwriting reveal moved here too, with the
 // same timing as the old ObjC drivers. The glyph setup (CoreText
 // paths) stays in Tweak.xm; only the animation driving moved.
+// v75: the pop is now an Apple Books-style ease-out zoom (0.45s, no
+// spring overshoot) — see animatePop. The cover fade and the
+// handwriting reveal are unchanged.
 @objc(MultitaskFloatOpenAnimator)
 public final class MultitaskFloatOpenAnimator: NSObject {
     // Every in-flight animator is held here until its own completion
@@ -32,17 +35,14 @@ public final class MultitaskFloatOpenAnimator: NSObject {
         // down around the tap anchor, transparent.
         view.transform = CGAffineTransform(scaleX: fromScale, y: fromScale)
         view.alpha = 0
-        // Native spring: mass 1, stiffness 170, damping 20. Damping
-        // ratio is about 0.77, so it settles with a slight overshoot
-        // instead of the old 0.3s stiff spring. Duration 0 lets the
-        // spring physics decide the settle time (about 0.6s).
-        let timing = UISpringTimingParameters(
-            mass: 1.0,
-            stiffness: 170,
-            damping: 20,
-            initialVelocity: .zero
-        )
-        let animator = UIViewPropertyAnimator(duration: 0, timingParameters: timing)
+        // v75: Apple Books-style open. The pop is no longer a spring —
+        // it is a clean ease-out zoom from the tap point, 0.45s, with
+        // no overshoot: quick start, gentle landing, exactly how a
+        // book cover grows into the reader. Corner radius morphs to
+        // the final radius and alpha ramps 0 -> 1 on the same curve,
+        // so the content fades in as the window lands.
+        let timing = UICubicTimingParameters(animationCurve: .easeOut)
+        let animator = UIViewPropertyAnimator(duration: 0.45, timingParameters: timing)
         animator.addAnimations {
             view.alpha = 1
             view.transform = .identity
