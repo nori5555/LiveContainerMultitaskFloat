@@ -1144,6 +1144,13 @@ static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
             MultitaskFloatBringPinnedToFront();
         }
     });
+    // v53: restart the per-frame link on every toggle, so a
+    // maximize/restore after the appear link stopped (30s) is still
+    // covered continuously (a single 0.35s sync can miss a late host
+    // reset, which is why restore-then-click was probabilistically
+    // square). StartDisplayLink is idempotent: a running link is a
+    // no-op, a stopped link restarts.
+    MultitaskFloatStartDisplayLink((DecoratedAppSceneViewController *)self);
 }
 
 static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
@@ -1160,6 +1167,8 @@ static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
             MultitaskFloatBringPinnedToFront();
         }
     });
+    // v53: same per-frame link restart as maximize (see above).
+    MultitaskFloatStartDisplayLink((DecoratedAppSceneViewController *)self);
 }
 
 // Last tap point, for the icon-origin open animation: the user taps
