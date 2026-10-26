@@ -1640,14 +1640,16 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
             [vc.view.superview addSubview:nameContainer];
         }
     }
-    // v69: the pop now runs through Swift's native spring API
-    // (UIViewPropertyAnimator + UISpringTimingParameters, in
-    // OpenAnimation.swift). Same start/end states as the old ObjC
-    // spring, only the driver changes. The completion below is
-    // unchanged: restore the anchor, settle chrome, recompute, fade
-    // the cover. If the Swift class is missing at runtime (Swift
-    // did not link), fall back to the old ObjC spring so the open
-    // still animates.
+    // v72: the whole open animation now runs through Swift's native
+    // animation API (UIViewPropertyAnimator in OpenAnimation.swift):
+    // the pop (spring), the cover fade, and the handwriting reveal.
+    // Same start/end states and timing as the old ObjC drivers, only
+    // the driver changes. The completion below is unchanged: restore
+    // the anchor, settle chrome, recompute, fade the cover. If the
+    // Swift class is missing at runtime (Swift did not link), fall
+    // back to the old ObjC animations so the open still animates.
+    Class swiftAnimatorCls = objc_getClass("MultitaskFloatOpenAnimator");
+    SEL swiftPopSel = @selector(animatePopWithView:fromScale:finalRadius:completion:);
     void (^popCompletion)(void) = ^{
         objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(vc, &kMultitaskFloatAnimatingOpenStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1691,17 +1693,24 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
         // can never outlive the fade even if the window closes
         // mid-fade. No-op when there is no cover (e.g. windowed
         // mode).
+        // v72: the cover fade now runs through Swift's native
+        // animation API too (fadeCover: in OpenAnimation.swift),
+        // with the old ObjC fade as fallback if Swift did not link.
         if (popCover) {
-            [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-                popCover.alpha = 0;
-            } completion:^(BOOL fadeFinished) {
-                (void)fadeFinished;
-                [popCover removeFromSuperview];
-            }];
+            SEL fadeSel = @selector(fadeCover:);
+            if (swiftAnimatorCls && [swiftAnimatorCls respondsToSelector:fadeSel]) {
+                typedef void (*MultitaskFloatFadeCoverIMP)(id, SEL, UIView *);
+                ((MultitaskFloatFadeCoverIMP)objc_msgSend)(swiftAnimatorCls, fadeSel, popCover);
+            } else {
+                [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+                    popCover.alpha = 0;
+                } completion:^(BOOL fadeFinished) {
+                    (void)fadeFinished;
+                    [popCover removeFromSuperview];
+                }];
+            }
         }
     };
-    Class swiftAnimatorCls = objc_getClass("MultitaskFloatOpenAnimator");
-    SEL swiftPopSel = @selector(animatePopWithView:fromScale:finalRadius:completion:);
     if (swiftAnimatorCls && [swiftAnimatorCls respondsToSelector:swiftPopSel]) {
         typedef void (*MultitaskFloatSwiftPopIMP)(id, SEL, UIView *, CGFloat, CGFloat, void (^)(void));
         ((MultitaskFloatSwiftPopIMP)objc_msgSend)(swiftAnimatorCls, swiftPopSel, view, startScale, finalRadius, popCompletion);
@@ -1715,31 +1724,37 @@ static void MultitaskFloatAnimateOpen(DecoratedAppSceneViewController *vc) {
             popCompletion();
         }];
     }
-    // v39: filled-stroke reveal: each glyph's filled ink
-    // widens left to right over 0.22s (the clip view's width
-    // grows from 0 to the full glyph width), staggered
-    // 0.12s apart, left to right (14 glyphs -> last one
-    // finishes at ~1.78s), concurrent with the pop. Then
-    // the whole container fades out over 0.15s and is
-    // removed (~1.9s total), so the strokes present slowly
-    // and linger a bit after the pop settles.
+    // v39: filled-stroke reveal (timing unchanged, driver now Swift
+    // in v72 — see below): each glyph's filled ink widens left to
+    // right over 0.22s, staggered 0.12s apart (14 glyphs -> last one
+    // finishes at ~1.78s), concurrent with the pop. Then the whole
+    // container fades out over 0.15s and is removed (~1.9s total),
+    // so the strokes present slowly and linger a bit after the pop
+    // settles.
     if (nameContainer) {
-        for (NSUInteger i = 0; i < nameClips.count; i++) {
-            UIView *clipView = nameClips[i];
-            CGFloat targetWidth = [nameClipWidths[i] floatValue];
-            CGRect clipFrame = clipView.frame;
-            [UIView animateWithDuration:0.22 delay:(i * 0.12) options:UIViewAnimationOptionCurveEaseOut animations:^{
-                clipView.frame = CGRectMake(clipFrame.origin.x, clipFrame.origin.y, targetWidth, clipFrame.size.height);
-            } completion:nil];
+        SEL handwritingSel = @selector(animateHandwritingWithContainer:clips:widths:);
+        if (swiftAnimatorCls && [swiftAnimatorCls respondsToSelector:handwritingSel]) {
+            typedef void (*MultitaskFloatHandwritingIMP)(id, SEL, UIView *, NSArray *, NSArray *);
+            ((MultitaskFloatHandwritingIMP)objc_msgSend)(swiftAnimatorCls, handwritingSel, nameContainer, nameClips, nameClipWidths);
+        } else {
+            // Fallback if Swift did not link: the old ObjC drivers.
+            for (NSUInteger i = 0; i < nameClips.count; i++) {
+                UIView *clipView = nameClips[i];
+                CGFloat targetWidth = [nameClipWidths[i] floatValue];
+                CGRect clipFrame = clipView.frame;
+                [UIView animateWithDuration:0.22 delay:(i * 0.12) options:UIViewAnimationOptionCurveEaseOut animations:^{
+                    clipView.frame = CGRectMake(clipFrame.origin.x, clipFrame.origin.y, targetWidth, clipFrame.size.height);
+                } completion:nil];
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.78 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+                    nameContainer.alpha = 0;
+                } completion:^(BOOL nameFinished) {
+                    (void)nameFinished;
+                    [nameContainer removeFromSuperview];
+                }];
+            });
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.78 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-                nameContainer.alpha = 0;
-            } completion:^(BOOL nameFinished) {
-                (void)nameFinished;
-                [nameContainer removeFromSuperview];
-            }];
-        });
     }
 }
 
@@ -1865,13 +1880,16 @@ static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
 // SyncWindowChrome is idempotent and mostly no-op when nothing
 // changed, so one pass per window every 5s costs nothing. The
 // chain stops itself when the window goes away, and the flag
-// prevents duplicate chains across re-appears.
+// prevents duplicate chains across re-appears. v72: windowed only
+// — maximized has no corners to fix.
 static void MultitaskFloatChromeWatchdog(DecoratedAppSceneViewController *vc) {
     if (!vc.view.window) {
         objc_setAssociatedObject(vc, &kMultitaskFloatWatchdogKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
-    MultitaskFloatSyncWindowChrome(vc);
+    if (!vc.isMaximized) {
+        MultitaskFloatSyncWindowChrome(vc);
+    }
     __weak DecoratedAppSceneViewController *weakVC = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         DecoratedAppSceneViewController *strongVC = weakVC;
