@@ -350,6 +350,8 @@ static const char kMultitaskFloatPillBorderDarkKey = 0;
 static const char kMultitaskFloatPinCapsulePinnedKey = 0;
 static const char kMultitaskFloatToggleTimeKey = 0;
 static const char kMultitaskFloatClosingKey = 0;
+static const char kMultitaskFloatDockedKey = 0;
+static const char kMultitaskFloatDockTabKey = 0;
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -602,10 +604,29 @@ static void MultitaskFloatPillPan(id self, SEL _cmd, UIPanGestureRecognizer *sen
     }
 }
 
+// v60: edge-dock helpers, defined after TogglePin (they call Sync
+// and StartDisplayLink, which are defined later); PillButton (here)
+// calls DockToEdge, so declare them first (v53 lesson: use before
+// declare fails the build).
+static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc);
+static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc);
+
 static void MultitaskFloatPillButton(id self, SEL _cmd, UIButton *sender) {
     DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
     if (sender.tag == 0) {
-        [vc minimizeWindow];
+        // v60: pinned + yellow minimize docks to the edge instead of
+        // minimizing normally — a blue drag bar means pinned; tapping
+        // yellow then leaves only a small blue bar at the screen edge,
+        // and tapping that bar restores the window. Unpinned, closing,
+        // or already docked keeps the old minimize path.
+        BOOL pinned = [objc_getAssociatedObject(vc, &kMultitaskFloatPinnedKey) boolValue];
+        BOOL closing = [objc_getAssociatedObject(vc, &kMultitaskFloatClosingKey) boolValue];
+        BOOL docked = [objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue];
+        if (pinned && !closing && !docked) {
+            MultitaskFloatDockToEdge(vc);
+        } else {
+            [vc minimizeWindow];
+        }
     } else if (sender.tag == 1) {
         [vc maximizeWindow];
         // The maximize icon flips in the completion (~0.3s); sync after it.
@@ -749,6 +770,10 @@ static void MultitaskFloatSyncPinCapsule(DecoratedAppSceneViewController *vc) {
 static void MultitaskFloatBringPinnedToFront(void) {
     if (!MultitaskFloatPinnedWindows) return;
     for (DecoratedAppSceneViewController *pinnedVC in MultitaskFloatPinnedWindows) {
+        // v60: skip edge-docked windows — the window is hidden and
+        // its edge tab is the visible UI; bringing a hidden window
+        // forward is pointless and could reorder its tab.
+        if ([objc_getAssociatedObject(pinnedVC, &kMultitaskFloatDockedKey) boolValue]) continue;
         if (pinnedVC.view && pinnedVC.view.superview) {
             [pinnedVC.view.superview bringSubviewToFront:pinnedVC.view];
             // v45: bringing the window forward puts it above its
@@ -810,6 +835,11 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     // window is fading out, and any repositioning (drag bar) or mask
     // rebuild would fight the fade.
     if ([objc_getAssociatedObject(vc, &kMultitaskFloatClosingKey) boolValue]) return;
+    // v60: skip all chrome sync while edge-docked — the window is
+    // hidden and the edge tab is the visible UI; syncing a hidden
+    // window's chrome is wasted and could reposition its hidden
+    // drag bar.
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
     // During the open animation (v29) the window's corners are part
     // of the pop (rounded while it scales in); layout passes during
     // the animation must not reset masks/cornerRadius, or the pop
@@ -1216,6 +1246,12 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
             DecoratedAppSceneViewController *strongVC = weakVC;
             if (strongVC) {
                 objc_setAssociatedObject(strongVC, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                // v60: also drop the edge-dock tab + docked flag, so a
+                // docked window that gets closed leaves no lingering tab.
+                UIView *dockTab = objc_getAssociatedObject(strongVC, &kMultitaskFloatDockTabKey);
+                if (dockTab) [dockTab removeFromSuperview];
+                objc_setAssociatedObject(strongVC, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(strongVC, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(strongVC, &kMultitaskFloatClosingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 if (strongVC.view.window && origCloseWindow) origCloseWindow(strongVC, _cmd);
             }
@@ -1231,6 +1267,11 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
         [dragBar removeFromSuperview];
         objc_setAssociatedObject(self, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    // v60: also drop the edge-dock tab + docked flag (see above).
+    UIView *dockTab = objc_getAssociatedObject(self, &kMultitaskFloatDockTabKey);
+    if (dockTab) [dockTab removeFromSuperview];
+    objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // v55: forward declaration — maximize/minimize call StartDisplayLink,
@@ -1634,6 +1675,12 @@ static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
         [dragBar removeFromSuperview];
         objc_setAssociatedObject(self, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    // v60: also drop the edge-dock tab + docked flag, so a docked
+    // window that goes away leaves no lingering tab.
+    UIView *dockTab = objc_getAssociatedObject(self, &kMultitaskFloatDockTabKey);
+    if (dockTab) [dockTab removeFromSuperview];
+    objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &kMultitaskFloatDockedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // v51: stop the per-frame link when the window goes away, so a
     // closed window never keeps ticking (the tick also stops itself
     // on nil window, this is the prompt path).
@@ -1948,6 +1995,117 @@ static void MultitaskFloatTogglePin(id self, SEL _cmd, UITapGestureRecognizer *s
         [MultitaskFloatPinnedWindows removeObject:vc];
     }
     MultitaskFloatSyncPinCapsule(vc);
+}
+
+// v60: edge-dock for pinned windows. Tapping yellow minimize on a
+// pinned window (blue drag bar) hides the window and leaves only a
+// small blue bar at the nearest screen edge; tapping that bar restores
+// the window. The window itself is never resized or moved in model
+// terms — docking slides it off-screen with a transform + fade (so
+// its frame/center stay original), and restoring slides it back with
+// transform identity + fade. isMaximized is untouched, so a docked
+// maximized window restores maximized and a docked small window
+// restores small. Pinned stays pinned across dock/restore (docking is
+// not unpinning).
+static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
+    if (!vc.view || !vc.view.window || !vc.view.superview) return;
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
+    UIView *parent = vc.view.superview;
+    UIWindow *window = vc.view.window;
+    CGSize screenSize = window.bounds.size;
+    // Window center in window (screen) coordinates, for the nearest
+    // edge and the tab's Y. vc.view.center is in superview coords,
+    // so convert — never assume superview == window.
+    CGRect windowFrameInWindow = [parent convertRect:vc.view.frame toView:window];
+    CGFloat centerXInWindow = windowFrameInWindow.origin.x + windowFrameInWindow.size.width / 2;
+    CGFloat centerYInWindow = windowFrameInWindow.origin.y + windowFrameInWindow.size.height / 2;
+    BOOL dockRight = (centerXInWindow >= screenSize.width / 2);
+    CGFloat tabYInWindow = centerYInWindow;
+    if (tabYInWindow < 50) tabYInWindow = 50;
+    if (tabYInWindow > screenSize.height - 50) tabYInWindow = screenSize.height - 50;
+    CGFloat tabXInWindow = dockRight ? (screenSize.width - 10) : 10;
+    // Edge tab: 44x80 hit area (tappable despite the small visual),
+    // 6x48 blue vertical capsule centered in it (the drag bar capsule
+    // rotated 90 degrees: same blue = pinned language, same small-bar
+    // reading). Created once per dock; removed on restore/close.
+    UIView *tab = objc_getAssociatedObject(vc, &kMultitaskFloatDockTabKey);
+    if (!tab) {
+        tab = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 44, 80)];
+        tab.backgroundColor = [UIColor clearColor];
+        UIView *capsule = [[UIView alloc] initWithFrame:CGRectMake(19, 16, 6, 48)];
+        capsule.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.9];
+        capsule.layer.cornerRadius = 3;
+        capsule.layer.masksToBounds = YES;
+        [tab addSubview:capsule];
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:vc action:@selector(MultitaskFloatDockTabTapped:)];
+        [tab addGestureRecognizer:tap];
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockTabKey, tab, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Position the tab in superview coords (convert from window
+    // coords) and park it above the window; keep it hidden until the
+    // window has slid away, so the window appears to become the tab.
+    CGPoint tabCenterInSuperview = [window convertPoint:CGPointMake(tabXInWindow, tabYInWindow) toView:parent];
+    tab.center = tabCenterInSuperview;
+    tab.hidden = YES;
+    if (tab.superview != parent) {
+        [parent insertSubview:tab aboveSubview:vc.view];
+    } else {
+        [parent bringSubviewToFront:tab];
+    }
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
+    // Slide the window off-screen toward the dock edge + fade out;
+    // the drag bar fades where it was (it does not slide with the
+    // window — it lives in the superview, not in vc.view). Transform
+    // only: center/bounds stay original, so restoring transform to
+    // identity returns the window exactly. Slide by a full screen
+    // width (not the window width) so every position — centered
+    // included — ends fully off-screen, not with a strip left.
+    CGFloat dx = dockRight ? screenSize.width : -screenSize.width;
+    [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        vc.view.transform = CGAffineTransformMakeTranslation(dx, 0);
+        vc.view.alpha = 0;
+        if (dragBar) dragBar.alpha = 0;
+    } completion:^(BOOL finished) {
+        (void)finished;
+        vc.view.hidden = YES;
+        if (dragBar) dragBar.hidden = YES;
+        tab.hidden = NO;
+    }];
+}
+
+static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
+    if (!vc.view) return;
+    if (![objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
+    // Remove the tab first: the window slides back from the edge as
+    // the tab vanishes, so the tab reads as becoming the window.
+    UIView *tab = objc_getAssociatedObject(vc, &kMultitaskFloatDockTabKey);
+    if (tab) [tab removeFromSuperview];
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Unhide at the docked transform (off-screen, alpha 0), so
+    // unhiding flashes nothing; then slide back to identity + fade
+    // in. The drag bar (small windows only — maximized hides it)
+    // fades back in where it was (it never moved during dock).
+    vc.view.hidden = NO;
+    UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
+    BOOL showBar = !vc.isMaximized;
+    if (dragBar && showBar) dragBar.hidden = NO;
+    [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        vc.view.transform = CGAffineTransformIdentity;
+        vc.view.alpha = 1;
+        if (dragBar && showBar) dragBar.alpha = 1;
+    } completion:^(BOOL finished) {
+        (void)finished;
+        MultitaskFloatSyncWindowChrome(vc);
+        MultitaskFloatStartDisplayLink(vc);
+    }];
+}
+
+static void MultitaskFloatDockTabTapped(id self, SEL _cmd, UITapGestureRecognizer *sender) {
+    (void)sender;
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    MultitaskFloatRestoreFromEdge(vc);
 }
 
 // Only take over button drags when maximized; otherwise let the
@@ -2366,6 +2524,8 @@ static void MultitaskFloatConstructor(void) {
     // Floating pill handlers are new selectors too, so adding them is safe.
     class_addMethod(cls, @selector(MultitaskFloatPillPan:), (IMP)MultitaskFloatPillPan, "v@:@");
     class_addMethod(cls, @selector(MultitaskFloatPillButton:), (IMP)MultitaskFloatPillButton, "v@:@");
+    // v60: edge-dock tab tap is a new selector too, so adding it is safe.
+    class_addMethod(cls, @selector(MultitaskFloatDockTabTapped:), (IMP)MultitaskFloatDockTabTapped, "v@:@");
     // v51: per-frame tick is a new selector too, so adding it is safe.
     class_addMethod(cls, @selector(MultitaskFloatDisplayLinkTick:), (IMP)MultitaskFloatDisplayLinkTick, "v@:@");
     // Last-tap capture for the icon-origin open animation: UIWindow
