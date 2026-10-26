@@ -352,6 +352,7 @@ static const char kMultitaskFloatToggleTimeKey = 0;
 static const char kMultitaskFloatClosingKey = 0;
 static const char kMultitaskFloatDockedKey = 0;
 static const char kMultitaskFloatDockTabKey = 0;
+static const char kMultitaskFloatDockWindowKey = 0; // v61: separate window so the tab stays above any app
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -1248,6 +1249,10 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
                 objc_setAssociatedObject(strongVC, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 // v60: also drop the edge-dock tab + docked flag, so a
                 // docked window that gets closed leaves no lingering tab.
+                // v61: also hide + drop the dock window (the tab lives in it now).
+                UIWindow *dockWindow = objc_getAssociatedObject(strongVC, &kMultitaskFloatDockWindowKey);
+                if (dockWindow) dockWindow.hidden = YES;
+                objc_setAssociatedObject(strongVC, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 UIView *dockTab = objc_getAssociatedObject(strongVC, &kMultitaskFloatDockTabKey);
                 if (dockTab) [dockTab removeFromSuperview];
                 objc_setAssociatedObject(strongVC, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1268,6 +1273,10 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
         objc_setAssociatedObject(self, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     // v60: also drop the edge-dock tab + docked flag (see above).
+    // v61: also hide + drop the dock window (the tab lives in it now).
+    UIWindow *dockWindow = objc_getAssociatedObject(self, &kMultitaskFloatDockWindowKey);
+    if (dockWindow) dockWindow.hidden = YES;
+    objc_setAssociatedObject(self, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIView *dockTab = objc_getAssociatedObject(self, &kMultitaskFloatDockTabKey);
     if (dockTab) [dockTab removeFromSuperview];
     objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1677,6 +1686,10 @@ static void MultitaskFloatViewDidDisappear(id self, SEL _cmd, BOOL animated) {
     }
     // v60: also drop the edge-dock tab + docked flag, so a docked
     // window that goes away leaves no lingering tab.
+    // v61: also hide + drop the dock window (the tab lives in it now).
+    UIWindow *dockWindow = objc_getAssociatedObject(self, &kMultitaskFloatDockWindowKey);
+    if (dockWindow) dockWindow.hidden = YES;
+    objc_setAssociatedObject(self, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIView *dockTab = objc_getAssociatedObject(self, &kMultitaskFloatDockTabKey);
     if (dockTab) [dockTab removeFromSuperview];
     objc_setAssociatedObject(self, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1999,7 +2012,7 @@ static void MultitaskFloatTogglePin(id self, SEL _cmd, UITapGestureRecognizer *s
 
 // v60: edge-dock for pinned windows. Tapping yellow minimize on a
 // pinned window (blue drag bar) hides the window and leaves only a
-// small blue bar at the nearest screen edge; tapping that bar restores
+// small blue bar at the left screen edge only; tapping that bar restores
 // the window. The window itself is never resized or moved in model
 // terms — docking slides it off-screen with a transform + fade (so
 // its frame/center stay original), and restoring slides it back with
@@ -2013,21 +2026,27 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     UIView *parent = vc.view.superview;
     UIWindow *window = vc.view.window;
     CGSize screenSize = window.bounds.size;
-    // Window center in window (screen) coordinates, for the nearest
-    // edge and the tab's Y. vc.view.center is in superview coords,
-    // so convert — never assume superview == window.
+    // Window center Y in window (screen) coordinates, for the tab's
+    // Y. vc.view.center is in superview coords, so convert — never
+    // assume superview == window. (v61: left edge only — the window
+    // X is no longer needed, the tab is always at the left edge.)
     CGRect windowFrameInWindow = [parent convertRect:vc.view.frame toView:window];
-    CGFloat centerXInWindow = windowFrameInWindow.origin.x + windowFrameInWindow.size.width / 2;
     CGFloat centerYInWindow = windowFrameInWindow.origin.y + windowFrameInWindow.size.height / 2;
-    BOOL dockRight = (centerXInWindow >= screenSize.width / 2);
     CGFloat tabYInWindow = centerYInWindow;
     if (tabYInWindow < 50) tabYInWindow = 50;
     if (tabYInWindow > screenSize.height - 50) tabYInWindow = screenSize.height - 50;
-    CGFloat tabXInWindow = dockRight ? (screenSize.width - 10) : 10;
+    CGFloat tabXInWindow = 10; // v61: left edge only
     // Edge tab: 44x80 hit area (tappable despite the small visual),
     // 6x48 blue vertical capsule centered in it (the drag bar capsule
     // rotated 90 degrees: same blue = pinned language, same small-bar
     // reading). Created once per dock; removed on restore/close.
+    // v61: the tab lives in its own UIWindow (alert level, frame =
+    // the tab rect), not in the window's superview — so it stays
+    // visible + tappable above ANY app (a maximized guest, another
+    // small window, the list), not just above its own window. The
+    // window frame is only 44x80, so touches outside the tab still
+    // reach the app below; the tab's transparent margins are the
+    // tap area, same as before.
     UIView *tab = objc_getAssociatedObject(vc, &kMultitaskFloatDockTabKey);
     if (!tab) {
         tab = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 44, 80)];
@@ -2041,16 +2060,22 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         [tab addGestureRecognizer:tap];
         objc_setAssociatedObject(vc, &kMultitaskFloatDockTabKey, tab, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    // Position the tab in superview coords (convert from window
-    // coords) and park it above the window; keep it hidden until the
-    // window has slid away, so the window appears to become the tab.
-    CGPoint tabCenterInSuperview = [window convertPoint:CGPointMake(tabXInWindow, tabYInWindow) toView:parent];
-    tab.center = tabCenterInSuperview;
-    tab.hidden = YES;
-    if (tab.superview != parent) {
-        [parent insertSubview:tab aboveSubview:vc.view];
+    // Position the dock window at the edge (screen coords: the
+    // window is full-screen at origin, so screen == window coords;
+    // no superview conversion needed). Keep the window hidden until
+    // the window has slid away, so the window appears to become the tab.
+    UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
+    if (!dockWindow) {
+        dockWindow = [[UIWindow alloc] initWithFrame:CGRectMake(tabXInWindow - 22, tabYInWindow - 40, 44, 80)];
+        dockWindow.windowLevel = UIWindowLevelAlert;
+        dockWindow.backgroundColor = [UIColor clearColor];
+        dockWindow.hidden = YES;
+        [dockWindow addSubview:tab];
+        objc_setAssociatedObject(vc, &kMultitaskFloatDockWindowKey, dockWindow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
-        [parent bringSubviewToFront:tab];
+        dockWindow.frame = CGRectMake(tabXInWindow - 22, tabYInWindow - 40, 44, 80);
+        dockWindow.hidden = YES;
+        if (tab.superview != dockWindow) [dockWindow addSubview:tab];
     }
     objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
@@ -2061,7 +2086,7 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     // identity returns the window exactly. Slide by a full screen
     // width (not the window width) so every position — centered
     // included — ends fully off-screen, not with a strip left.
-    CGFloat dx = dockRight ? screenSize.width : -screenSize.width;
+    CGFloat dx = -screenSize.width; // v61: left edge only
     [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
         vc.view.transform = CGAffineTransformMakeTranslation(dx, 0);
         vc.view.alpha = 0;
@@ -2070,15 +2095,21 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         (void)finished;
         vc.view.hidden = YES;
         if (dragBar) dragBar.hidden = YES;
-        tab.hidden = NO;
+        dockWindow.hidden = NO;
     }];
 }
 
 static void MultitaskFloatRestoreFromEdge(DecoratedAppSceneViewController *vc) {
     if (!vc.view) return;
     if (![objc_getAssociatedObject(vc, &kMultitaskFloatDockedKey) boolValue]) return;
-    // Remove the tab first: the window slides back from the edge as
-    // the tab vanishes, so the tab reads as becoming the window.
+    // Hide the dock window first: the window slides back from the
+    // edge as the tab vanishes, so the tab reads as becoming the
+    // window. Hiding + clearing the window also releases the tab
+    // (it was the window's subview); clear its association too so
+    // no dangling tab remains.
+    UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
+    if (dockWindow) dockWindow.hidden = YES;
+    objc_setAssociatedObject(vc, &kMultitaskFloatDockWindowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIView *tab = objc_getAssociatedObject(vc, &kMultitaskFloatDockTabKey);
     if (tab) [tab removeFromSuperview];
     objc_setAssociatedObject(vc, &kMultitaskFloatDockTabKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
