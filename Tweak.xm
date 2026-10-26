@@ -1888,16 +1888,16 @@ static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
 // SyncWindowChrome is idempotent and mostly no-op when nothing
 // changed, so one pass per window every 5s costs nothing. The
 // chain stops itself when the window goes away, and the flag
-// prevents duplicate chains across re-appears. v72: windowed only
-// — maximized has no corners to fix.
+// prevents duplicate chains across re-appears. v72 made it windowed
+// only, but v74 reverts that: the user hit square corners right
+// after shrinking from maximized, so the watchdog syncs in both
+// modes (maximized syncs clear the masks, windowed syncs round them).
 static void MultitaskFloatChromeWatchdog(DecoratedAppSceneViewController *vc) {
     if (!vc.view.window) {
         objc_setAssociatedObject(vc, &kMultitaskFloatWatchdogKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
-    if (!vc.isMaximized) {
-        MultitaskFloatSyncWindowChrome(vc);
-    }
+    MultitaskFloatSyncWindowChrome(vc);
     __weak DecoratedAppSceneViewController *weakVC = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         DecoratedAppSceneViewController *strongVC = weakVC;
