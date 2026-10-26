@@ -349,6 +349,7 @@ static const char kMultitaskFloatMaskRadiusKey = 0;
 static const char kMultitaskFloatPillBorderDarkKey = 0;
 static const char kMultitaskFloatPinCapsulePinnedKey = 0;
 static const char kMultitaskFloatForceSmallKey = 0;
+static const char kMultitaskFloatClosingKey = 0;
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -787,10 +788,17 @@ static void MultitaskFloatApplyCornerMask(UIView *view, CGFloat radius) {
     if (!wantMask) {
         view.layer.mask = nil;
     } else {
-        CAShapeLayer *mask = [CAShapeLayer layer];
+        // v57 perf: reuse the existing mask layer (update frame/path
+        // in place) instead of allocating a new layer every frame
+        // during animations — a new layer each frame churns the
+        // render tree and costs CPU (heat) for no visual difference.
+        CAShapeLayer *mask = (CAShapeLayer *)view.layer.mask;
+        if (![mask isKindOfClass:[CAShapeLayer class]]) {
+            mask = [CAShapeLayer layer];
+            view.layer.mask = mask;
+        }
         mask.frame = view.bounds;
         mask.path = [UIBezierPath bezierPathWithRoundedRect:view.bounds cornerRadius:radius].CGPath;
-        view.layer.mask = mask;
     }
     objc_setAssociatedObject(view, &kMultitaskFloatMaskBoundsKey, [NSValue valueWithCGRect:view.bounds], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(view, &kMultitaskFloatMaskRadiusKey, @(radius), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -798,6 +806,10 @@ static void MultitaskFloatApplyCornerMask(UIView *view, CGFloat radius) {
 
 static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) {
     if (!vc.view) return;
+    // v57: skip all chrome sync during the close animation — the
+    // window is fading out, and any repositioning (drag bar) or mask
+    // rebuild would fight the fade.
+    if ([objc_getAssociatedObject(vc, &kMultitaskFloatClosingKey) boolValue]) return;
     // During the open animation (v29) the window's corners are part
     // of the pop (rounded while it scales in); layout passes during
     // the animation must not reset masks/cornerRadius, or the pop
@@ -817,11 +829,15 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     BOOL forceSmall = [objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue];
     BOOL effectiveMaximized = vc.isMaximized && !forceSmall;
     if (!animatingOpen) {
+        // v57 perf: only write layer properties when they actually
+        // change — setting the same cornerRadius/masksToBounds every
+        // frame still costs a render commit each time.
         if (effectiveMaximized) {
-            vc.view.layer.masksToBounds = NO;
+            if (vc.view.layer.masksToBounds) vc.view.layer.masksToBounds = NO;
         } else {
-            vc.view.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
-            vc.view.layer.masksToBounds = YES;
+            CGFloat deviceRadius = MultitaskFloatDeviceCornerRadius();
+            if (vc.view.layer.cornerRadius != deviceRadius) vc.view.layer.cornerRadius = deviceRadius;
+            if (!vc.view.layer.masksToBounds) vc.view.layer.masksToBounds = YES;
         }
         // v45: also clip the scene view itself (defense-in-depth for
         // rounded corners). Some apps end up square in small-window
@@ -832,11 +848,12 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         UIView *sceneView = vc.appSceneVC.view;
         if (sceneView) {
             if (effectiveMaximized) {
-                sceneView.layer.cornerRadius = 0;
-                sceneView.layer.masksToBounds = NO;
+                if (sceneView.layer.cornerRadius != 0) sceneView.layer.cornerRadius = 0;
+                if (sceneView.layer.masksToBounds) sceneView.layer.masksToBounds = NO;
             } else {
-                sceneView.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
-                sceneView.layer.masksToBounds = YES;
+                CGFloat sceneRadius = MultitaskFloatDeviceCornerRadius();
+                if (sceneView.layer.cornerRadius != sceneRadius) sceneView.layer.cornerRadius = sceneRadius;
+                if (!sceneView.layer.masksToBounds) sceneView.layer.masksToBounds = YES;
             }
         }
         // v46: layer mask on both views (see helper). Maximized
@@ -1118,6 +1135,8 @@ static VoidIMP origCloseWindow = NULL;
 // outside the smaller view. Run the layout pass after every
 // maximize/minimize toggle so the clamp (and safe-area fix) apply
 // on both directions.
+// v57 note: small windows now animate out first (see function below);
+// the v48 immediate path is kept for maximized/re-entrant closes.
 // v48: immediate drag-bar removal on close. v47's viewDidDisappear
 // cleanup works, but the host only tears the window down seconds
 // after the close tap, so the bar lingered on the list for a few
@@ -1130,6 +1149,53 @@ static VoidIMP origCloseWindow = NULL;
 // closed bar is never recreated. Idempotent with viewDidDisappear
 // (whichever runs second sees nil and does nothing).
 static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
+    DecoratedAppSceneViewController *vc = (DecoratedAppSceneViewController *)self;
+    // v57: small-window close animation. The host's closeWindow
+    // removes the window immediately (no animation), so a small
+    // window just vanishes. Animate it out (scale 0.92 + fade,
+    // 0.25s ease-out, drag bar fades with it), then call orig in
+    // the completion. Maximized closes keep the old immediate path
+    // (unchanged). Re-entrant taps during the animation are ignored
+    // (the first completion will close it). forceSmall counts as
+    // small here (closing mid-shrink still animates out).
+    BOOL forceSmall = [objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue];
+    BOOL isSmall = !vc.isMaximized || forceSmall;
+    BOOL alreadyClosing = [objc_getAssociatedObject(vc, &kMultitaskFloatClosingKey) boolValue];
+    if (isSmall && vc.view.window && !alreadyClosing) {
+        objc_setAssociatedObject(vc, &kMultitaskFloatClosingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // Stop the per-frame link now (window is going away; ticks
+        // must not fight the fade by repositioning the bar).
+        id link = objc_getAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey);
+        if (link) {
+            @try { ((void (*)(id, SEL))objc_msgSend)(link, @selector(invalidate)); } @catch (NSException *e) {}
+            objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
+        __weak DecoratedAppSceneViewController *weakVC = vc;
+        [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+            vc.view.alpha = 0;
+            vc.view.transform = CGAffineTransformMakeScale(0.92, 0.92);
+            if (dragBar) dragBar.alpha = 0;
+        } completion:^(BOOL finished) {
+            // The bar faded with the window; remove it now. Call
+            // orig only if the window is still there (a host-side
+            // close in the meantime already removed it — don't
+            // double-close). Clearing the flags first lets any later
+            // sync see clean state.
+            if (dragBar) [dragBar removeFromSuperview];
+            DecoratedAppSceneViewController *strongVC = weakVC;
+            if (strongVC) {
+                objc_setAssociatedObject(strongVC, &kMultitaskFloatDragBarKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(strongVC, &kMultitaskFloatClosingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (strongVC.view.window && origCloseWindow) origCloseWindow(strongVC, _cmd);
+            }
+        }];
+        return;
+    }
+    // Maximized close, re-entrant close, or no window: v48 immediate
+    // path (orig first, bar removed at once; viewDidDisappear stays
+    // as the fallback for close paths that bypass closeWindow).
     if (origCloseWindow) origCloseWindow(self, _cmd);
     UIView *dragBar = objc_getAssociatedObject(self, &kMultitaskFloatDragBarKey);
     if (dragBar) {
@@ -1579,7 +1645,15 @@ static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
         // v56: don't skip ticks during a shrink animation — the flag
         // is still maximized then, but the forced-small chrome must
         // track the shrinking bounds every frame.
-        if (vc.isMaximized && ![objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue]) return;
+        // v57 perf: when maximized, stop the link outright instead of
+        // waking 60x/sec for 5s just to return early — restore
+        // restarts it via MaximizeWindow (v53), so nothing is lost.
+        if (vc.isMaximized && ![objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue]) {
+            ((void (*)(id, SEL))objc_msgSend)(link, @selector(invalidate));
+            objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return;
+        }
         MultitaskFloatSyncWindowChrome(vc);
     } @catch (NSException *e) {}
 }
