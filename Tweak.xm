@@ -348,6 +348,7 @@ static const char kMultitaskFloatMaskBoundsKey = 0;
 static const char kMultitaskFloatMaskRadiusKey = 0;
 static const char kMultitaskFloatPillBorderDarkKey = 0;
 static const char kMultitaskFloatPinCapsulePinnedKey = 0;
+static const char kMultitaskFloatForceSmallKey = 0;
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -804,8 +805,19 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     // clipping outright). The drag bar and pill border below still
     // sync. The animation's completion re-syncs chrome itself.
     BOOL animatingOpen = [objc_getAssociatedObject(vc, &kMultitaskFloatAnimatingOpenKey) boolValue];
+    // v56: force small-window chrome during a shrink animation.
+    // The toggle animates over ~0.3s and isMaximized can stay stale
+    // (still maximized) through it, so a plain isMaximized check
+    // keeps the mask cleared and the corners square for the whole
+    // shrink, then snaps rounded at landing — the square flash on
+    // minimize/restore. Minimize (and a maximize-toggle that
+    // restores) set this flag; every later toggle overwrites it, and
+    // YES + not-maximized is identical to NO + not-maximized, so no
+    // explicit clear is needed.
+    BOOL forceSmall = [objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue];
+    BOOL effectiveMaximized = vc.isMaximized && !forceSmall;
     if (!animatingOpen) {
-        if (vc.isMaximized) {
+        if (effectiveMaximized) {
             vc.view.layer.masksToBounds = NO;
         } else {
             vc.view.layer.cornerRadius = MultitaskFloatDeviceCornerRadius();
@@ -819,7 +831,7 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         // shape. Maximized clears both (full-screen, square).
         UIView *sceneView = vc.appSceneVC.view;
         if (sceneView) {
-            if (vc.isMaximized) {
+            if (effectiveMaximized) {
                 sceneView.layer.cornerRadius = 0;
                 sceneView.layer.masksToBounds = NO;
             } else {
@@ -832,7 +844,7 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         // the device radius. Left untouched while animatingOpen
         // (the pop animates cornerRadius itself; a rounded mask
         // would freeze it rounded and snap square at completion).
-        if (vc.isMaximized) {
+        if (effectiveMaximized) {
             MultitaskFloatApplyCornerMask(vc.view, 0);
             MultitaskFloatApplyCornerMask(sceneView, 0);
         } else {
@@ -890,8 +902,8 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
     // appears in place.
     // v47: also hide when the window is gone or hidden (closed /
     // minimized) so a superview bar never floats over the list.
-    dragBar.hidden = vc.isMaximized || animatingOpen || !vc.view.window || vc.view.hidden;
-    if (!vc.isMaximized) {
+    dragBar.hidden = effectiveMaximized || animatingOpen || !vc.view.window || vc.view.hidden;
+    if (!effectiveMaximized) {
         // v45: drag bar sits just outside the window's top edge
         // (capsule 3–9pt above it) so it is always grabbable and the
         // app's own top controls can never intercept the drag — the
@@ -1132,7 +1144,12 @@ static void MultitaskFloatCloseWindow(id self, SEL _cmd) {
 static void MultitaskFloatStartDisplayLink(DecoratedAppSceneViewController *vc);
 
 static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
+    // v56: capture the pre-toggle state — if this tap restores to a
+    // small window, force small chrome through the animation (see
+    // SyncWindowChrome); if it maximizes, clear any stale force flag.
+    BOOL wasMaximized = [(DecoratedAppSceneViewController *)self isMaximized];
     if (origMaximizeWindow) origMaximizeWindow(self, _cmd);
+    objc_setAssociatedObject(self, &kMultitaskFloatForceSmallKey, @(wasMaximized), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
     // Delayed chrome sync: the immediate ApplyLayout can run with a
     // stale isMaximized or intermediate bounds (the toggle animates
@@ -1159,6 +1176,10 @@ static void MultitaskFloatMaximizeWindow(id self, SEL _cmd) {
 }
 
 static void MultitaskFloatMinimizeWindow(id self, SEL _cmd) {
+    // v56: minimize always targets a small window — force small chrome
+    // through the animation (see SyncWindowChrome). Overwritten on
+    // every later toggle, so no explicit clear is needed.
+    objc_setAssociatedObject(self, &kMultitaskFloatForceSmallKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (origMinimizeWindow) origMinimizeWindow(self, _cmd);
     MultitaskFloatApplyLayout((DecoratedAppSceneViewController *)self);
     // Same delayed chrome sync as maximize (see above).
@@ -1555,7 +1576,10 @@ static void MultitaskFloatDisplayLinkTick(id self, SEL _cmd, id link) {
             objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             return;
         }
-        if (vc.isMaximized) return;
+        // v56: don't skip ticks during a shrink animation — the flag
+        // is still maximized then, but the forced-small chrome must
+        // track the shrinking bounds every frame.
+        if (vc.isMaximized && ![objc_getAssociatedObject(vc, &kMultitaskFloatForceSmallKey) boolValue]) return;
         MultitaskFloatSyncWindowChrome(vc);
     } @catch (NSException *e) {}
 }
