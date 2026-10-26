@@ -44,6 +44,20 @@
 // devices without a Taptic Engine and needs no entitlement or new
 // framework (UIKit only).
 
+// v79: the watchdog made the docked blue tab flash. The v77
+// re-assert runs on every watchdog tick (5s) and every layout pass
+// via BringPinnedToFront, and each run unconditionally wrote
+// dockWindow.hidden = YES (in Ensure) then NO (in Reassert), plus
+// rewrote the tab window's frame and scene — yanking the tab
+// window out of the scene's visible list and back again every
+// tick, which reads as a flash. Fix: a re-assert that finds the
+// dock already correct is now a pure no-op — hidden, frame and
+// scene are only written when they actually differ, and hidden
+// ownership moved to the callers (DockToEdge hides during the
+// slide, Reassert only shows when hidden). The 5s re-assert
+// itself stays: it is the safety net that keeps the docked window
+// from running to the right edge (v77).
+
 // LiveContainer's multitasking virtual windows are DecoratedAppSceneViewController:
 // a vertical stack of [44pt UINavigationBar, content]. The bar holds the app
 // title (with its title menu, the "AssppPro v" control) and three
@@ -2309,8 +2323,17 @@ static CGFloat MultitaskFloatDockTabY(DecoratedAppSceneViewController *vc, CGRec
 // the window at the left edge. Shared by DockToEdge and
 // ReassertDock, so a tab dropped by an old handler (or a window
 // the host moved) is rebuilt at the left edge instead of staying
-// lost. Leaves the dock window hidden; the caller shows it when
-// the window has slid away (DockToEdge) or at once (ReassertDock).
+// lost.
+// v79: this function never touches the dock window's hidden flag,
+// and only writes frame / windowScene when they actually differ.
+// The old version set hidden = YES on every call (and Reassert
+// then set it back to NO), plus rewrote frame and scene each time
+// — that yanked the tab window out of the scene's visible list
+// and back again on every watchdog tick (5s) and every layout
+// pass, which read as the blue tab flashing. A re-assert that
+// finds everything already correct must be a pure no-op (the
+// file's v52/v57 "only write when changed" rule); the caller owns
+// hidden: DockToEdge hides it during the slide, Reassert shows it.
 static void MultitaskFloatEnsureDockTabWindow(DecoratedAppSceneViewController *vc, CGFloat tabYInWindow, UIWindow *window) {
     // v65: bigger edge tab: 64x120 hit area (tappable despite the small visual),
     // 10x80 blue vertical capsule centered in it (the drag bar capsule
@@ -2354,9 +2377,12 @@ static void MultitaskFloatEnsureDockTabWindow(DecoratedAppSceneViewController *v
         [dockWindow addSubview:tab];
         objc_setAssociatedObject(vc, &kMultitaskFloatDockWindowKey, dockWindow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
-        dockWindow.frame = CGRectMake(tabXInWindow - 32, tabYInWindow - 60, 64, 120);
-        if (window) dockWindow.windowScene = window.windowScene;
-        dockWindow.hidden = YES;
+        // v79: only write when changed (see above) — an
+        // unconditional frame/scene write every tick also
+        // re-composites the tab window for nothing.
+        CGRect wantedFrame = CGRectMake(tabXInWindow - 32, tabYInWindow - 60, 64, 120);
+        if (!CGRectEqualToRect(dockWindow.frame, wantedFrame)) dockWindow.frame = wantedFrame;
+        if (window && dockWindow.windowScene != window.windowScene) dockWindow.windowScene = window.windowScene;
         if (tab.superview != dockWindow) [dockWindow addSubview:tab];
     }
 }
@@ -2417,9 +2443,13 @@ static void MultitaskFloatReassertDock(DecoratedAppSceneViewController *vc) {
     CGFloat tabY = MultitaskFloatDockTabY(vc, savedFrame, window, screenSize);
     MultitaskFloatEnsureDockTabWindow(vc, tabY, window);
     UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
-    if (dockWindow) dockWindow.hidden = NO;
+    // v79: only show it if it is hidden — unconditionally writing
+    // hidden = NO every tick (after Ensure wrote YES) was the
+    // flash: the tab window left the scene's visible list and came
+    // back every 5s. A correct dock is now a pure no-op here.
+    if (dockWindow && dockWindow.hidden) dockWindow.hidden = NO;
     UIView *dragBar = objc_getAssociatedObject(vc, &kMultitaskFloatDragBarKey);
-    if (dragBar) dragBar.hidden = YES;
+    if (dragBar && !dragBar.hidden) dragBar.hidden = YES;
 }
 
 static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
@@ -2468,6 +2498,10 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     CGFloat tabYInWindow = MultitaskFloatDockTabY(vc, savedFrame, window, screenSize);
     MultitaskFloatEnsureDockTabWindow(vc, tabYInWindow, window);
     UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
+    // v79: Ensure no longer hides the dock window (see above), so
+    // hide it here: the tab must stay hidden until the window has
+    // slid away, so the window appears to become the tab.
+    if (dockWindow) dockWindow.hidden = YES;
     objc_setAssociatedObject(vc, &kMultitaskFloatDockedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     MultitaskFloatDockedVC = vc; // v63: single dock — record the docked window
     objc_setAssociatedObject(vc, &kMultitaskFloatDockAnimatingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v66
