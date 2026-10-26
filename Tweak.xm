@@ -474,6 +474,18 @@ static void MultitaskFloatForceHideDock(id self, SEL _cmd) {
     MultitaskFloatHideDockManager(self);
 }
 
+// v62: setter swizzle — force isCollapsed to YES so the dock can
+// never come back, no matter which path asks to show it (showDock,
+// toggle, or a direct setIsCollapsed:NO from the host when a window
+// is hidden/docked). The dock is meant to stay gone (v14 spec), so
+// blocking show is correct, not just hiding at startup.
+typedef void (*MultitaskFloatSetCollapsedIMP)(id, SEL, BOOL);
+static MultitaskFloatSetCollapsedIMP origSetIsCollapsed = NULL;
+static void MultitaskFloatSetIsCollapsed(id self, SEL _cmd, BOOL collapsed) {
+    (void)collapsed; // ignore the request; dock stays collapsed (hidden)
+    if (origSetIsCollapsed) origSetIsCollapsed(self, _cmd, YES);
+}
+
 static void MultitaskFloatSwizzleDock(void) {
     if (dockSwizzled) return;
     Class cls = MultitaskFloatDockManagerClass();
@@ -491,6 +503,15 @@ static void MultitaskFloatSwizzleDock(void) {
     if (mShow) method_setImplementation(mShow, (IMP)MultitaskFloatForceHideDock);
     Method mToggle = class_getInstanceMethod(cls, @selector(toggleDockVisibility));
     if (mToggle) method_setImplementation(mToggle, (IMP)MultitaskFloatForceHideDock);
+    // v62: also force the collapsed setter to YES, so a direct
+    // setIsCollapsed:NO (e.g. host showing the dock when a window
+    // is hidden/docked) cannot bring the dock back. The show-method
+    // redirects above do not catch a direct setter call.
+    Method mSetCollapsed = class_getInstanceMethod(cls, @selector(setIsCollapsed:));
+    if (mSetCollapsed) {
+        origSetIsCollapsed = (MultitaskFloatSetCollapsedIMP)method_getImplementation(mSetCollapsed);
+        method_setImplementation(mSetCollapsed, (IMP)MultitaskFloatSetIsCollapsed);
+    }
     dockSwizzled = YES;
 }
 
@@ -2067,6 +2088,10 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
     UIWindow *dockWindow = objc_getAssociatedObject(vc, &kMultitaskFloatDockWindowKey);
     if (!dockWindow) {
         dockWindow = [[UIWindow alloc] initWithFrame:CGRectMake(tabXInWindow - 22, tabYInWindow - 40, 44, 80)];
+        // v62: a UIWindow without a scene never renders (iOS 13+) —
+        // that is why the v61 tab never appeared. Attach the host
+        // window's scene so the tab actually shows above any app.
+        dockWindow.windowScene = window.windowScene;
         dockWindow.windowLevel = UIWindowLevelAlert;
         dockWindow.backgroundColor = [UIColor clearColor];
         dockWindow.hidden = YES;
@@ -2074,6 +2099,7 @@ static void MultitaskFloatDockToEdge(DecoratedAppSceneViewController *vc) {
         objc_setAssociatedObject(vc, &kMultitaskFloatDockWindowKey, dockWindow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
         dockWindow.frame = CGRectMake(tabXInWindow - 22, tabYInWindow - 40, 44, 80);
+        dockWindow.windowScene = window.windowScene;
         dockWindow.hidden = YES;
         if (tab.superview != dockWindow) [dockWindow addSubview:tab];
     }
