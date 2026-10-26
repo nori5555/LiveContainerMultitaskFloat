@@ -344,6 +344,10 @@ static const char kMultitaskFloatDotKey = 0;
 static const char kMultitaskFloatDotTapTimeKey = 0;
 static const char kMultitaskFloatDisplayLinkKey = 0;
 static const char kMultitaskFloatDisplayLinkStartKey = 0;
+static const char kMultitaskFloatMaskBoundsKey = 0;
+static const char kMultitaskFloatMaskRadiusKey = 0;
+static const char kMultitaskFloatPillBorderDarkKey = 0;
+static const char kMultitaskFloatPinCapsulePinnedKey = 0;
 
 // Pinned windows (v40): weak refs, so a closed window drops out on
 // its own — no dangling pointers, no retain cycles. Created lazily
@@ -532,8 +536,14 @@ static id MultitaskFloatInitImpl(id self, SEL _cmd, NSString *windowName, NSStri
 static void MultitaskFloatApplyPillBorder(UIView *pill, UIView *view) {
     if (!pill || !view) return;
     BOOL dark = (view.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    // v52 power: border color is a pure function of dark, so skip
+    // rebuilding it every frame/layout when appearance is unchanged
+    // (the NULL check covers an externally cleared border).
+    NSNumber *cachedDark = objc_getAssociatedObject(pill, &kMultitaskFloatPillBorderDarkKey);
+    if (cachedDark && [cachedDark boolValue] == dark && pill.layer.borderColor != NULL) return;
     UIColor *c = dark ? [[UIColor whiteColor] colorWithAlphaComponent:0.6] : [[UIColor blackColor] colorWithAlphaComponent:0.6];
     pill.layer.borderColor = c.CGColor;
+    objc_setAssociatedObject(pill, &kMultitaskFloatPillBorderDarkKey, @(dark), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void MultitaskFloatSyncPill(DecoratedAppSceneViewController *vc) {
@@ -721,7 +731,13 @@ static void MultitaskFloatSyncPinCapsule(DecoratedAppSceneViewController *vc) {
     if (!dragBar || dragBar.subviews.count == 0) return;
     UIView *capsule = dragBar.subviews[0];
     BOOL pinned = [objc_getAssociatedObject(vc, &kMultitaskFloatPinnedKey) boolValue];
+    // v52 power: capsule color is a pure function of pinned, so skip
+    // rebuilding it every frame/layout when pin state is unchanged
+    // (the nil check covers an externally cleared color).
+    NSNumber *cachedPinned = objc_getAssociatedObject(capsule, &kMultitaskFloatPinCapsulePinnedKey);
+    if (cachedPinned && [cachedPinned boolValue] == pinned && capsule.backgroundColor != nil) return;
     capsule.backgroundColor = pinned ? [[UIColor systemBlueColor] colorWithAlphaComponent:0.9] : [[UIColor systemGrayColor] colorWithAlphaComponent:0.65];
+    objc_setAssociatedObject(capsule, &kMultitaskFloatPinCapsulePinnedKey, @(pinned), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // v40: re-assert every pinned window above all other windows.
@@ -757,14 +773,26 @@ static void MultitaskFloatBringPinnedToFront(void) {
 // from a zero rect would clip the view to nothing (invisible).
 static void MultitaskFloatApplyCornerMask(UIView *view, CGFloat radius) {
     if (!view) return;
-    if (radius <= 0 || CGRectGetWidth(view.bounds) <= 0 || CGRectGetHeight(view.bounds) <= 0) {
+    // v52 power: the mask is a pure function of (bounds, radius),
+    // and the host never touches layer.mask (v46 comment), so when
+    // both are unchanged the existing mask is already correct —
+    // skip rebuilding a new layer + path + render commit every
+    // frame/layout. The mask-presence check covers an externally
+    // cleared mask (rebuild next call, same as before).
+    BOOL wantMask = (radius > 0 && CGRectGetWidth(view.bounds) > 0 && CGRectGetHeight(view.bounds) > 0);
+    NSValue *cachedBounds = objc_getAssociatedObject(view, &kMultitaskFloatMaskBoundsKey);
+    NSNumber *cachedRadius = objc_getAssociatedObject(view, &kMultitaskFloatMaskRadiusKey);
+    if (cachedBounds && cachedRadius && CGRectEqualToRect([cachedBounds CGRectValue], view.bounds) && [cachedRadius doubleValue] == radius && ((wantMask && view.layer.mask != nil) || (!wantMask && view.layer.mask == nil))) return;
+    if (!wantMask) {
         view.layer.mask = nil;
-        return;
+    } else {
+        CAShapeLayer *mask = [CAShapeLayer layer];
+        mask.frame = view.bounds;
+        mask.path = [UIBezierPath bezierPathWithRoundedRect:view.bounds cornerRadius:radius].CGPath;
+        view.layer.mask = mask;
     }
-    CAShapeLayer *mask = [CAShapeLayer layer];
-    mask.frame = view.bounds;
-    mask.path = [UIBezierPath bezierPathWithRoundedRect:view.bounds cornerRadius:radius].CGPath;
-    view.layer.mask = mask;
+    objc_setAssociatedObject(view, &kMultitaskFloatMaskBoundsKey, [NSValue valueWithCGRect:view.bounds], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &kMultitaskFloatMaskRadiusKey, @(radius), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) {
@@ -880,20 +908,28 @@ static void MultitaskFloatSyncWindowChrome(DecoratedAppSceneViewController *vc) 
         // almost never parked exactly at top-center.
         UIView *parent = vc.view.superview;
         if (parent) {
-            if (dragBar.superview != parent) [parent addSubview:dragBar];
             CGFloat windowTop = vc.view.frame.origin.y;
             CGFloat windowMidX = vc.view.frame.origin.x + vc.view.frame.size.width / 2;
             CGFloat centerY = windowTop - 6;
             if (centerY < 22) centerY = 22;
-            dragBar.center = CGPointMake(windowMidX, centerY);
-            [parent insertSubview:dragBar aboveSubview:vc.view];
+            CGPoint wantCenter = CGPointMake(windowMidX, centerY);
+            // v52 power: skip the hierarchy mutation + position set
+            // when the bar is already in the right parent, at the
+            // right center, and already above the window — the end
+            // state is identical, only the redundant work is gone.
+            BOOL barAbove = ([parent.subviews indexOfObject:dragBar] > [parent.subviews indexOfObject:vc.view]);
+            if (dragBar.superview != parent || !CGPointEqualToPoint(dragBar.center, wantCenter) || !barAbove) {
+                if (dragBar.superview != parent) [parent addSubview:dragBar];
+                dragBar.center = wantCenter;
+                [parent insertSubview:dragBar aboveSubview:vc.view];
+            }
         } else {
             CGRect b = vc.view.bounds;
             dragBar.center = CGPointMake(b.origin.x + b.size.width / 2, b.origin.y + 22);
             [vc.view bringSubviewToFront:dragBar];
         }
         UIView *pillTop = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
-        if (pillTop) [vc.view bringSubviewToFront:pillTop];
+        if (pillTop && vc.view.subviews.lastObject != pillTop) [vc.view bringSubviewToFront:pillTop];
     }
     // Pill border follows appearance (v27): re-applied on every
     // layout pass, so a system day/night switch recolors it without
