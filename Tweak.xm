@@ -104,6 +104,35 @@
 // would create the manager before a key window exists, and its
 // init force-unwraps keyWindow.
 
+// v82: v81 FAILED — and made it worse. The user reported the dock
+// came OUT (screenshot: the blue CollapsedDockView tab, chevron.up,
+// fully visible on the right edge). Root cause, from the source:
+// the dock view's opacity is 0.01 only when isDockHidden &&
+// hideCollapsedDock && isCollapsed are ALL true
+// (MultitaskDockView.swift:870). v80 kept isDockHidden true by
+// calling the real hideDockToSide on every layout; v81 made
+// hideDockToSide a no-op and removed the per-layout hide, so
+// isDockHidden stayed false and opacity went to 1.0 — while the
+// kill itself silently did nothing, because KVC cannot reach the
+// manager's internal (non-@objc) Swift `hostingController`
+// property: its read returns nil (or throws), so the kill skipped
+// everything believing the dock was already dead, and the fallback
+// could not hide the view either. Meanwhile showDock is called
+// from Swift (addRunningAppWithInfo), which bypasses the no-op
+// swizzle, so the view kept being added and shown at full opacity.
+// v82 fixes all three: (1) the kill reads/writes the ivar
+// directly (class_getInstanceVariable + object_getIvar /
+// object_setIvar, verified by reading the ivar back — ground
+// truth KVC cannot give), with KVC only as a fallback; (2) a
+// last-resort sweep removes any SwiftUI hosting view that is a
+// direct, narrow subview of the key window; (3) hideDockToSide is
+// restored to the original and the per-layout kill is back, so if
+// the kill ever fails again the dock is hidden the v80 way
+// (isDockHidden true -> opacity 0.01) instead of appearing. The
+// raw ivar write leaks the one hosting controller (object_setIvar
+// does not release the old value) — once, tiny, and the ivar stays
+// nil so it cannot repeat.
+
 // LiveContainer's multitasking virtual windows are DecoratedAppSceneViewController:
 // a vertical stack of [44pt UINavigationBar, content]. The bar holds the app
 // title (with its title menu, the "AssppPro v" control) and three
@@ -586,16 +615,40 @@ static void MultitaskFloatHideDockManager(id manager) {
     } @catch (id e) {}
 }
 
-// v81: kill the dock instead of hiding it. Nil-ing the manager's
-// hostingController (see the v81 header note for why this is safe:
-// every dock method guards on it, nothing else touches it) and
-// removing its view first if it is already in the hierarchy. The
-// write is verified by reading back — if KVC did not stick, fall
-// back to the old hide path so the dock can never come back
-// visible. Cheap when already dead: one cached class lookup, one
-// shared access, one KVC read. Never call from the ctor (see the
-// v81 header note: [shared] before a key window exists would crash
-// the manager's init on its keyWindow! force-unwrap).
+// v82: the host's key window, same lookup the dock itself uses:
+// the first connected scene's first window.
+static UIWindow *MultitaskFloatKeyWindow(void) {
+    UIWindow *w = nil;
+    @try {
+        id app = ((id (*)(id, SEL))objc_msgSend)(objc_getClass("UIApplication"), @selector(sharedApplication));
+        id scenes = ((id (*)(id, SEL))objc_msgSend)(app, @selector(connectedScenes));
+        id scene = [scenes anyObject];
+        id windows = ((id (*)(id, SEL))objc_msgSend)(scene, @selector(windows));
+        w = [windows firstObject];
+    } @catch (id e) {}
+    if (!w) {
+        @try {
+            id app = ((id (*)(id, SEL))objc_msgSend)(objc_getClass("UIApplication"), @selector(sharedApplication));
+            w = ((UIWindow *(*)(id, SEL))objc_msgSend)(app, @selector(keyWindow));
+        } @catch (id e) {}
+    }
+    return w;
+}
+
+// v82: kill the dock instead of hiding it — take two. Nil-ing the
+// manager's hostingController (see the v81 header note for why this
+// is safe: every dock method guards on it, nothing else touches
+// it) and removing its view first if it is already in the
+// hierarchy. v81 did this through KVC and silently did nothing:
+// KVC cannot see the internal Swift property. This version reads
+// and writes the ivar directly (class_getInstanceVariable +
+// object_getIvar / object_setIvar) and verifies by reading the
+// ivar back — ground truth KVC cannot give — with KVC only as a
+// fallback for the read. Cheap when already dead: one cached class
+// lookup, one shared access, one ivar read. Never call from the
+// ctor (see the v81 header note: [shared] before a key window
+// exists would crash the manager's init on its keyWindow!
+// force-unwrap).
 static void MultitaskFloatKillDock(void) {
     Class cls = MultitaskFloatDockManagerClassCached();
     if (!cls) return;
@@ -607,19 +660,51 @@ static void MultitaskFloatKillDock(void) {
     }
     if (!manager) return;
     @try {
-        id hc = [manager valueForKey:@"hostingController"];
-        if (hc) {
-            UIView *dockView = [hc valueForKey:@"view"];
-            if (dockView) [dockView removeFromSuperview];
-            [manager setValue:nil forKey:@"hostingController"];
+        Ivar iv = class_getInstanceVariable(cls, "hostingController");
+        id hc = iv ? object_getIvar(manager, iv) : nil;
+        if (!hc) {
+            @try { hc = [manager valueForKey:@"hostingController"]; } @catch (id e) {}
         }
-        // Verify the write stuck; if it did not (a Swift
-        // stored-property quirk), hide the dock the old way.
-        if ([manager valueForKey:@"hostingController"]) {
+        if (hc) {
+            UIView *dockView = nil;
+            @try { dockView = ((UIView *(*)(id, SEL))objc_msgSend)(hc, @selector(view)); } @catch (id e) {}
+            if (dockView) [dockView removeFromSuperview];
+            // KVC first (correct memory management), then the raw
+            // ivar write if KVC did not stick. The raw write leaks
+            // the one hosting controller (object_setIvar does not
+            // release the old value) — once, tiny, and the ivar
+            // stays nil so it cannot repeat.
+            @try { [manager setValue:nil forKey:@"hostingController"]; } @catch (id e) {}
+            if (iv && object_getIvar(manager, iv)) {
+                object_setIvar(manager, iv, nil);
+            }
+        }
+        // Verify by the ivar (ground truth), not by KVC.
+        BOOL stillAlive = NO;
+        if (iv) {
+            stillAlive = object_getIvar(manager, iv) != nil;
+        } else {
+            @try { stillAlive = [manager valueForKey:@"hostingController"] != nil; } @catch (id e) { stillAlive = NO; }
+        }
+        if (stillAlive) {
             MultitaskFloatHideDockManager(manager);
         }
+        // Last resort: sweep the key window for the dock's hosting
+        // view. The tweak's own views are UIKit and LiveContainer's
+        // main SwiftUI UI lives under the root view controller, so a
+        // direct key-window subview that is a SwiftUI hosting view
+        // and narrow (the dock is dockWidth wide) is the dock.
+        UIWindow *keyWindow = MultitaskFloatKeyWindow();
+        if (keyWindow) {
+            for (UIView *sub in [keyWindow.subviews copy]) {
+                NSString *name = NSStringFromClass([sub class]);
+                if ([name hasPrefix:@"_UIHostingView"] && sub.bounds.size.width < 200) {
+                    [sub removeFromSuperview];
+                }
+            }
+        }
     } @catch (id e) {
-        // KVC failure: fall back to hiding, never crash on the dock.
+        // Any failure: fall back to hiding, never crash on the dock.
         @try { MultitaskFloatHideDockManager(manager); } @catch (id e2) {}
     }
 }
@@ -654,19 +739,22 @@ static void MultitaskFloatSwizzleDock(void) {
     if (dockSwizzled) return;
     Class cls = MultitaskFloatDockManagerClassCached();
     if (!cls) return;
-    // v81: the dock is removed, not hidden, so every path that
-    // could show it or arm its edge gestures is a no-op now — not a
-    // redirect to the hide helper (there is nothing left to hide).
+    // v81: the dock is removed, not hidden, so the paths that
+    // could show it or arm its edge gestures are no-ops now.
     // Only redirect when the methods actually exist, so the
     // redirect never sends an unimplemented selector.
+    // v82: hideDockToSide is DELIBERATELY left original — v81 made
+    // it a no-op and that is what let the dock out: it is the call
+    // that sets isDockHidden, and the dock view's opacity is 0.01
+    // only while isDockHidden is true. With the kill working it is
+    // moot; if the kill ever fails, the fallback hide path needs
+    // the real hideDockToSide (off-screen + opacity 0.01).
     Method mShowDock = class_getInstanceMethod(cls, @selector(showDock));
     if (mShowDock) method_setImplementation(mShowDock, (IMP)MultitaskFloatDockNoop);
     Method mShow = class_getInstanceMethod(cls, @selector(showDockFromHidden));
     if (mShow) method_setImplementation(mShow, (IMP)MultitaskFloatDockNoop);
     Method mToggle = class_getInstanceMethod(cls, @selector(toggleDockVisibility));
     if (mToggle) method_setImplementation(mToggle, (IMP)MultitaskFloatDockNoop);
-    Method mHideSide = class_getInstanceMethod(cls, @selector(hideDockToSide));
-    if (mHideSide) method_setImplementation(mHideSide, (IMP)MultitaskFloatDockNoop);
     // The edge-swipe handler is @objc private, so it is in the
     // runtime: no-op it too, so a swipe from the screen edge cannot
     // wake the dock even if the gestures were installed before the
@@ -1377,9 +1465,12 @@ static void MultitaskFloatApplyLayout(DecoratedAppSceneViewController *vc) {
         // IMP below), so every host recompute produces the compensated
         // value instead of wiping an after-the-fact update.
     }
-    // v81: no per-layout dock work — the dock has no hosting
-    // controller, so nothing can appear late; the 5s watchdog
-    // re-kills it if one ever shows up.
+    // v82: re-kill the dock on every layout pass — showDock is
+    // called from Swift, which bypasses the no-op swizzle, so a
+    // late-created hostingController can put the view back; the
+    // kill removes it again here (cheap when dead: one ivar read).
+    // v81 removed this and the dock came out; do not remove it.
+    MultitaskFloatKillDock();
     // Place the floating pill once, when the window exists: top-right,
     // just below the status bar when maximized, at the decorated view's
     // top-right when windowed. After that the user owns the position.
