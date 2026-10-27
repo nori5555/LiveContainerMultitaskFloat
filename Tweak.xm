@@ -659,6 +659,47 @@ static void MultitaskFloatKillDock(void) {
         return;
     }
     if (!manager) return;
+    // v83: pin isCollapsed to YES — the v80 behaviour v81/v82
+    // dropped, and the cause of the post-toggle misalignment
+    // (controls shifted up, white band at the bottom). v80's
+    // HideDockManager called the real setIsCollapsed:YES setter on
+    // every layout pass; v81/v82 replaced it with KillDock, which
+    // never touches isCollapsed, and the setIsCollapsed: swizzle
+    // cannot pin it on its own: the only Swift-side write is
+    // toggleDockCollapse's `self.isCollapsed.toggle()`, a
+    // Swift-internal set that bypasses ObjC dispatch, and nothing
+    // calls the setter via ObjC — so the swizzle never fires and
+    // isCollapsed stays at its default (false). With isCollapsed
+    // false, the host shows the 44pt nav bar when maximized
+    // (hideWindowBar = isCollapsed && isMaximized): the host sizes
+    // the guest's frame 44pt short, while our ApplyLayout still
+    // shifts the scene up 59pt under the status bar — a ~103pt
+    // mismatch, so the guest's bottom-anchored controls sit ~103pt
+    // too high and the bottom of the scene shows white. Pinning it
+    // here restores v80's layout (bar hidden when maximized, scene
+    // and guest frame the same height) without bringing back the
+    // per-layout hideDockToSide / updateDockFrame / defaults churn
+    // the heat review flagged: this is one getter per layout, and
+    // the setter only fires when it is actually false. Use the real
+    // setter (not KVC) for isCollapsed: @Published properties do
+    // not reliably accept KVC writes, but the @objc setter does
+    // notify SwiftUI. Fall back to KVC if no setter.
+    @try {
+        BOOL collapsed = NO;
+        if ([manager respondsToSelector:@selector(isCollapsed)]) {
+            collapsed = ((BOOL (*)(id, SEL))objc_msgSend)(manager, @selector(isCollapsed));
+        } else {
+            id v = [manager valueForKey:@"isCollapsed"];
+            collapsed = v ? [v boolValue] : NO;
+        }
+        if (!collapsed) {
+            if ([manager respondsToSelector:@selector(setIsCollapsed:)]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(manager, @selector(setIsCollapsed:), YES);
+            } else {
+                [manager setValue:@YES forKey:@"isCollapsed"];
+            }
+        }
+    } @catch (id e) {}
     @try {
         Ivar iv = class_getInstanceVariable(cls, "hostingController");
         id hc = iv ? object_getIvar(manager, iv) : nil;
