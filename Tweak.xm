@@ -477,6 +477,8 @@ static const char kMultitaskFloatMaskBoundsKey = 0;
 static const char kMultitaskFloatMaskRadiusKey = 0;
 static const char kMultitaskFloatPillBorderDarkKey = 0;
 static const char kMultitaskFloatPinCapsulePinnedKey = 0;
+static const char kMultitaskFloatPillMaximizedKey = 0; // v84: pill icon state cache (see SyncPill)
+static const char kMultitaskFloatLastTopAddKey = 0; // v84: last top safe-area add written (see FixTopSafeArea)
 static const char kMultitaskFloatToggleTimeKey = 0;
 static const char kMultitaskFloatClosingKey = 0;
 static const char kMultitaskFloatDockedKey = 0;
@@ -735,12 +737,21 @@ static void MultitaskFloatKillDock(void) {
         // main SwiftUI UI lives under the root view controller, so a
         // direct key-window subview that is a SwiftUI hosting view
         // and narrow (the dock is dockWidth wide) is the dock.
-        UIWindow *keyWindow = MultitaskFloatKeyWindow();
-        if (keyWindow) {
-            for (UIView *sub in [keyWindow.subviews copy]) {
-                NSString *name = NSStringFromClass([sub class]);
-                if ([name hasPrefix:@"_UIHostingView"] && sub.bounds.size.width < 200) {
-                    [sub removeFromSuperview];
+        // v84 power: this runs on every layout pass, but the sweep
+        // can only find anything when a hostingController exists
+        // (hc), the ivar cannot be read (iv == nil, unverifiable),
+        // or the kill failed (stillAlive) — when the ivar reads nil
+        // the dock is verifiably dead and the enumeration is pure
+        // overhead, so skip it then. The next KillDock still
+        // catches a late-created hostingController (hc != nil).
+        if (hc || !iv || stillAlive) {
+            UIWindow *keyWindow = MultitaskFloatKeyWindow();
+            if (keyWindow) {
+                for (UIView *sub in [keyWindow.subviews copy]) {
+                    NSString *name = NSStringFromClass([sub class]);
+                    if ([name hasPrefix:@"_UIHostingView"] && sub.bounds.size.width < 200) {
+                        [sub removeFromSuperview];
+                    }
                 }
             }
         }
@@ -819,15 +830,27 @@ static void MultitaskFloatSwizzleDock(void) {
 
 static void MultitaskFloatStripBar(DecoratedAppSceneViewController *vc) {
     if (!vc.navigationItem) return;
+    // v84 power: this runs on every layout pass, and the old code
+    // built two fresh [UIImage new] and re-set the bar images every
+    // time (each set re-renders/invalidates the bar). The strip is a
+    // pure function of the current bar state, so only write when
+    // something actually differs — same dedupe pattern as v52 (pill
+    // border, pin capsule) and v57 (layer writes). The blank image
+    // is created once and compared by pointer: if the host replaced
+    // it with a different image, we re-strip.
+    static UIImage *blankBarImage = nil;
+    if (!blankBarImage) blankBarImage = [UIImage new];
     // No app name, no menu chevron.
-    vc.navigationItem.title = nil;
-    vc.navigationItem.titleMenuProvider = nil;
+    if (vc.navigationItem.title != nil) vc.navigationItem.title = nil;
+    if (vc.navigationItem.titleMenuProvider != nil) vc.navigationItem.titleMenuProvider = nil;
     // Fully transparent bar: no background, no hairline, no dark tint.
     UINavigationBar *bar = vc.navigationBar;
     if (bar) {
-        bar.translucent = YES;
-        [bar setBackgroundImage:[UIImage new] forBarMetrics:UIBarMetricsDefault];
-        bar.shadowImage = [UIImage new];
+        if (!bar.translucent) bar.translucent = YES;
+        if ([bar backgroundImageForBarMetrics:UIBarMetricsDefault] != blankBarImage) {
+            [bar setBackgroundImage:blankBarImage forBarMetrics:UIBarMetricsDefault];
+        }
+        if (bar.shadowImage != blankBarImage) bar.shadowImage = blankBarImage;
     }
 }
 
@@ -883,12 +906,34 @@ static void MultitaskFloatSyncPill(DecoratedAppSceneViewController *vc) {
     if (!vc) return;
     UIView *pill = objc_getAssociatedObject(vc, &kMultitaskFloatPillKey);
     if (!pill) return;
+    // v84 power: this runs on every layout pass, and the old code
+    // rebuilt the SF Symbol image + symbol configuration and called
+    // setImage: every time (each set re-lays-out the button). The
+    // icon is a pure function of isMaximized, so only rebuild when
+    // the state changed — same dedupe pattern as v52. The configured
+    // images are built once per process (they are identical for
+    // every window). The nil-image check covers a recreated button.
+    static UIImage *imgMaximized = nil;
+    static UIImage *imgWindowed = nil;
+    if (!imgMaximized) {
+        UIImage *img = [UIImage systemImageNamed:@"arrow.down.right.and.arrow.up.left.circle"];
+        UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
+        imgMaximized = [img imageWithConfiguration:cfg];
+    }
+    if (!imgWindowed) {
+        UIImage *img = [UIImage systemImageNamed:@"arrow.up.left.and.arrow.down.right.circle"];
+        UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
+        imgWindowed = [img imageWithConfiguration:cfg];
+    }
+    BOOL maximized = vc.isMaximized;
+    NSNumber *cachedMaximized = objc_getAssociatedObject(vc, &kMultitaskFloatPillMaximizedKey);
     for (UIView *v in pill.subviews) {
         if ([v isKindOfClass:[UIButton class]] && v.tag == 1) {
-            NSString *name = vc.isMaximized ? @"arrow.down.right.and.arrow.up.left.circle" : @"arrow.up.left.and.arrow.down.right.circle";
-            UIImage *img = [UIImage systemImageNamed:name];
-            UIImageConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
-            [(UIButton *)v setImage:[img imageWithConfiguration:cfg] forState:UIControlStateNormal];
+            UIButton *btn = (UIButton *)v;
+            if (!cachedMaximized || [cachedMaximized boolValue] != maximized || [btn imageForState:UIControlStateNormal] == nil) {
+                [btn setImage:(maximized ? imgMaximized : imgWindowed) forState:UIControlStateNormal];
+                objc_setAssociatedObject(vc, &kMultitaskFloatPillMaximizedKey, @(maximized), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
             break;
         }
     }
@@ -2213,6 +2258,16 @@ static void MultitaskFloatStartDisplayLink(DecoratedAppSceneViewController *vc) 
         if (!dlCls) return;
         id link = ((id (*)(id, SEL, id, SEL))objc_msgSend)(dlCls, @selector(displayLinkWithTarget:selector:), vc, @selector(MultitaskFloatDisplayLinkTick:));
         if (!link) return;
+        // v84 power: the link used to run at the display refresh
+        // rate (up to 120Hz on ProMotion) for 5s per windowed
+        // window, waking the CPU 120x/sec to re-sync chrome that
+        // is already deduped inside SyncWindowChrome. 30Hz is a
+        // quarter of the wakeups: a host reset is still caught
+        // within ~33ms (imperceptible), and a 0.3s toggle animation
+        // still gets ~9 ticks. No visual difference, much less heat.
+        if ([link respondsToSelector:@selector(setPreferredFramesPerSecond:)]) {
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(link, @selector(setPreferredFramesPerSecond:), 30);
+        }
         ((void (*)(id, SEL, id, id))objc_msgSend)(link, @selector(addToRunLoop:forMode:), [NSRunLoop mainRunLoop], NSDefaultRunLoopMode);
         objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkKey, link, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(vc, &kMultitaskFloatDisplayLinkStartKey, @([[NSDate date] timeIntervalSince1970]), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -2464,10 +2519,22 @@ static void MultitaskFloatViewDidLayoutSubviews(id self, SEL _cmd) {
 // later recompute at the same value, because the original resets the
 // base first and the swizzle adds on top each time.
 static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc) {
-    if (!vc.isMaximized || !vc.view.window || !vc.appSceneVC) return;
+    // v84 power: clear the cached add when not maximized, so a
+    // later maximize re-writes — the host zeroes the insets on
+    // restore, and a stale cache would skip the re-write.
+    if (!vc.isMaximized) {
+        objc_setAssociatedObject(vc, &kMultitaskFloatLastTopAddKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    if (!vc.view.window || !vc.appSceneVC) return;
     AppSceneViewController *appVC = vc.appSceneVC;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!vc.isMaximized || !vc.view.window) return;
+        if (!vc.isMaximized || !vc.view.window) {
+            if (!vc.isMaximized) {
+                objc_setAssociatedObject(vc, &kMultitaskFloatLastTopAddKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            return;
+        }
         // v30: during the open pop the view carries a scale transform,
         // so convertRect below would return a transformed origin and
         // commit a wrong top inset (top blocked / bottom cut until a
@@ -2493,6 +2560,20 @@ static void MultitaskFloatFixTopSafeArea(DecoratedAppSceneViewController *vc) {
             if (v > 0) scale = (CGFloat)v;
         } @catch (id e) {}
         CGFloat add = off / scale;
+        // v84 power: updateSettingsWithBlock triggers a full host
+        // settings recompute + guest relayout, and this runs on
+        // every layout pass — but `add` is effectively constant
+        // (portrait maximized: window top safe area, scale 1.0),
+        // so writing the same value again only burns CPU (heat)
+        // for no visual difference. Skip when unchanged (0.5pt
+        // epsilon for float noise). Safe: the swizzle inside the
+        // host's own recompute re-grows the value on every host
+        // wipe, so this write is only the belt to its braces, and
+        // the cache is cleared on restore (above) and re-checked
+        // here on every pass.
+        NSNumber *lastAdd = objc_getAssociatedObject(vc, &kMultitaskFloatLastTopAddKey);
+        if (lastAdd && fabs([lastAdd doubleValue] - (double)add) < 0.5) return;
+        objc_setAssociatedObject(vc, &kMultitaskFloatLastTopAddKey, @(add), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [appVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
             UIEdgeInsets p = settings.peripheryInsets;
             p.top = add;
